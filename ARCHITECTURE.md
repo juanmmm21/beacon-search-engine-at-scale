@@ -493,3 +493,323 @@ published, or decide a global document budget across the whole cluster
 `CrawlWorkerConfig.max_pages` in phase 1). It hands the next phase a corpus
 of clean, partitioned documents in object storage, plus a manifest
 describing exactly where to find them, to build on.
+
+## Phase 3 — Distributed indexing
+
+This phase extends the phase-0 substrate with the third domain workload:
+turning the partitioned, clean documents phase 2 wrote into object storage
+into a single global inverted index, in the exact on-disk format
+`inverted-index-builder` already defines and `index-compression-codec`
+already consumes.
+
+`inverted-index-builder` (one of the ten original `beacon-search-engine`
+repositories) already implements the algorithm — tokenization, positional
+postings, document-frequency accounting — for a single process reading one
+`documents.jsonl` file to completion (`IndexBuilder.build`,
+`src/inverted_index_builder/pipeline.py`). That repository stays untouched
+(see "Why the ten original repos stay untouched" above): this phase reuses
+`IndexBuilder.build` and `inverted_index_builder.serialization.write_index`
+unmodified, as a real package dependency (pinned Git URL in `pyproject.toml`,
+same pattern as phases 1–2), and adds only what a single process reading one
+file cannot do — build a consistent global index out of N part-files written
+independently by N phase-2 workers with no coordination between them.
+
+### 0. Why this phase cannot start until phase 2 is "done" — a batch boundary, not a stream
+
+Phases 1→2 are a continuous pipeline: `ExtractWorker` consumes pages *as the
+crawler produces them*, with no notion of the crawl having "finished" before
+extraction can start. Phase 3 is deliberately different: it needs the phase-2
+manifest's `document_count` per partition to be **final**, because those
+counts are exactly what the doc_id range assignment below is computed from
+(section 1). Computing ranges from a manifest that is still being updated by
+running `ExtractWorker` instances would invalidate every range already
+handed out the moment any partition's count grows — a partition's range
+would need to shift to stay contiguous with the next one, which would in
+turn move every doc_id downstream of it, including ones already burned into
+postings that were already remapped and merged. This is why phase 3 is
+structured as a one-shot batch job (`IndexingPipeline.run()`,
+`index/pipeline.py`) invoked once phase 2's workers have stopped, not a
+long-running worker consuming a queue like `CrawlWorker`/`ExtractWorker` —
+there is no meaningful streaming version of "assign a stable position in a
+total order" while the set being ordered is still growing.
+
+### 1. Global `doc_id` assignment — contiguous per-partition ranges from the manifest, not a centralized counter
+
+**The problem:** `IndexBuilder.build(documents_path)` assigns `doc_id` as a
+0-based counter over the non-blank lines of a *single* input file, and
+documents this as a hard determinism contract (`inverted-index-builder`
+`README.md`, "Determinism and correctness"). That contract is meaningless
+once the corpus lives across N part-files written independently by N
+phase-2 workers: there is no single file, and no single process ever sees
+every document.
+
+**Decision:** each partition (one per phase-2 `worker_id`) is assigned a
+contiguous, disjoint half-open range of global `doc_id`s
+`[start, start + document_count)`, computed from the phase-2 manifest
+(`extract/manifest.py`) alone — no document is read to compute a range, only
+counted. Ranges are assigned in ascending order of `partition_key` (the
+`worker_id` string, compared lexicographically): partition ranges are sorted
+once, and each partition's `start` is the running sum of `document_count`
+over every partition that sorts before it
+(`index/doc_id_ranges.py::compute_doc_id_ranges`). Within a partition, a
+document's global `doc_id` is `start + local_doc_id`, where `local_doc_id` is
+exactly what `IndexBuilder.build` assigns when it reads that partition's
+part-files concatenated in ascending `part_seq` order (`documents-000000
+.jsonl`, then `documents-000001.jsonl`, ...) into one materialized file
+(`index/partition_indexer.py::materialize_partition_documents`). Because
+`part_seq` and `partition_key` are both already deterministic, stable
+identifiers written by phase 2, the entire range assignment — and therefore
+every global `doc_id` — is a pure function of the manifest plus the part-file
+contents, reproducible from the same phase-2 output with no coordination
+step of its own.
+
+**Why not a centralized counter (an `INCR` against Redis, one call per
+document):** this is the most literal translation of "0-based counter,
+strictly increasing" to a distributed setting, and was rejected for the
+reason the task itself names — it puts a single point of coordination in the
+hot path of indexing millions of documents, exactly the kind of bottleneck
+phase 0 already rejected once for the crawl frontier (see "Message queue"
+above: the whole reason `MessageQueue` uses consumer-group fan-out instead
+of a single arbiter is to avoid one shared piece of mutable state that every
+worker must serialize through). A per-partition range needs exactly one
+piece of shared state per partition (its `document_count`, already sitting
+in the manifest phase 2 produces for free) instead of one round-trip per
+document.
+
+**Why not a hash-based `doc_id` (e.g. a stable hash of the URL, truncated to
+an integer range):** this was rejected because it breaks the ascending-order
+contract `PostingsList` postings depend on. `inverted-index-builder`'s
+`README.md` and `index-compression-codec`'s delta encoding both depend on
+postings being sorted by ascending `doc_id` *within a term* — a hash
+scatters unrelated integers with no relationship to insertion or partition
+order, which would force an explicit sort of every postings list after
+hashing (an `O(n log n)` step the current single-machine pipeline never
+needs) and would also make "which partition owns this `doc_id`" an O(1)
+lookup on paper but a red herring in practice, because nothing about a hash
+value tells you which partition actually wrote that document — you would
+still need a separate global reverse index from `doc_id` to partition,
+duplicating exactly the bookkeeping the range scheme gives away for free.
+
+**Why per-partition ranges compress trivially back to "which partition owns
+this doc_id":** because ranges are contiguous and sorted by construction, the
+question "which partition owns doc_id `d`" is a binary search over at most
+(number of partitions) range boundaries — not over documents
+(`DocIdRangeAssignment.partition_for`, `index/doc_id_ranges.py`), using
+`bisect.bisect_right` over the sorted `start` offsets. At this phase's scale
+(a few million documents across, realistically, tens to low hundreds of
+worker partitions, not millions of partitions), this is a handful of integer
+comparisons — the "cheap, given a doc_id, resolve which partition it belongs
+to" property required of any scheme here, without needing an explicit
+per-document `doc_id → partition` index at all.
+
+### 2. The map-reduce pipeline
+
+**Map** (`index/partition_indexer.py`, one independent unit of work per
+partition, embarrassingly parallel in the same sense phase 2's extraction
+was — see phase 2, section 2): for each partition, in ascending
+`partition_key` order,
+
+1. materialize that partition's `documents-*.jsonl` part-files, concatenated
+   in ascending `part_seq` order, into one local file — this is the same
+   shape of input `IndexBuilder.build` already expects, just assembled from
+   several part-files instead of coming from a single `html-content-extractor`
+   run;
+2. call `IndexBuilder().build(materialized_path)` **unmodified** — the
+   partition-local index it returns uses `local_doc_id`s 0-indexed within
+   that partition, exactly as documented upstream;
+3. remap every `doc_id` the partition-local index carries — both
+   `InvertedIndex.documents` keys/`DocumentRecord.doc_id` and every
+   `Posting.doc_id` inside every `PostingsList` — by adding that partition's
+   `start` offset from section 1 (`remap_index_to_global_doc_ids`). Adding a
+   constant is order-preserving, so a partition-local postings list that was
+   already ascending by `local_doc_id` (guaranteed by `IndexBuilder` itself)
+   stays ascending by global `doc_id` after remapping, with no re-sort
+   needed.
+
+**Reduce** (`index/merge.py::merge_partition_indexes`): merges the N
+already-remapped, partition-local `InvertedIndex` objects into one global
+`InvertedIndex`. This is genuinely new logic — no repo in the ecosystem
+merges N pre-built indexes into one today — but it is deliberately thin,
+because the hard part (producing a correct total order) was already solved
+by section 1's range assignment, not by this step:
+
+- `documents`: a plain union of the per-partition dicts. Ranges are disjoint
+  by construction, so no two partitions can ever produce the same global
+  `doc_id`; the merge asserts this (raising `IndexingError` if it ever sees
+  a collision) as a integrity check on section 1's invariant, not as
+  a case it needs to actually handle.
+- `postings_lists`, per term: **concatenation, not a merge-sort.** Because
+  partitions are processed in the same ascending `partition_key` order their
+  ranges were assigned in, and each partition's own postings for a term are
+  already ascending by global `doc_id` (previous paragraph), concatenating
+  partition 1's postings for a term, then partition 2's, then partition 3's,
+  ... yields a list that is already fully sorted ascending by `doc_id` —
+  the ordering work is a side effect of doing section 1 and the map step
+  correctly, not a separate sorting pass over postings. `document_frequency`
+  for the merged list is the sum of the per-partition document frequencies
+  (safe to sum, not re-derive, because a document is indexed by exactly one
+  partition).
+- `stats` (`IndexStats`): recomputed once over the merged `documents`/
+  `postings_lists`, the same arithmetic `IndexBuilder._compute_stats` does
+  internally — not reused directly because that method is private to
+  `IndexBuilder` and operates on a single build pass, but it is pure
+  aggregation (`sum`/`len`), not indexing logic, so recomputing it here is
+  not a reimplementation of anything `inverted-index-builder` is meant to
+  own.
+
+The merged `InvertedIndex` is written to disk with
+`inverted_index_builder.serialization.write_index` **unmodified** —
+`manifest.json`, `documents.jsonl`, `postings.jsonl`, `stats.json`, byte-for-byte
+the same format a single-machine `inverted-index-builder` run would produce,
+then uploaded to the phase-0 `ObjectStorage` under `index_output_prefix`
+(default `search-index/`). No format is written by hand anywhere in this
+phase.
+
+### 3. Compression handoff — `index-compression-codec`, unmodified, confirmed by test
+
+`CompressionPipeline.compress(source_index_dir, output_dir)` reads exactly
+the four files `write_index` produces and knows nothing about how they were
+built — its own contract (`index-compression-codec` `README.md`, "Role in
+beacon-search-engine") is "an `inverted-index-builder`-shaped directory in,
+a compressed index directory out". Because phase 3's merge step already
+produces that exact directory shape via the unmodified `write_index` call
+above, `IndexingPipeline.run()` calls `CompressionPipeline().compress()` on
+it with zero adaptation. `tests/test_index_pipeline.py` asserts this
+directly — compressing the merged output must succeed and the compressed
+`documents.jsonl`/`stats.json` (copied through unmodified by the codec) must
+still describe the same total document count phase 3 computed — rather than
+assuming compatibility from the shared format documentation alone.
+
+### 4. What determinism is preserved, and what changes — verified against a single-file build
+
+`~/Desarrollo/beacon-search-engine/CLAUDE.md`, section 2.B, requires that
+building an index from the same input always produces the same result. That
+guarantee is preserved by this phase, but its two components are affected
+differently:
+
+**Preserved, unchanged: postings order within a term is still stable and
+reproducible.** Section 2 above is exactly the argument for why: ascending
+`local_doc_id` order (guaranteed by unmodified `IndexBuilder`) plus a
+constant per-partition offset (order-preserving) plus partition-ordered
+concatenation (not a merge-sort, so nothing depends on a stable-sort
+implementation detail) composes into a globally ascending, fully
+deterministic order, given the same phase-2 output and the same manifest.
+
+**Changed, and documented here as the new exact rule: `doc_id` is no longer
+"line position in a single input file".** The new rule is: *`doc_id` is the
+cumulative document count of every partition that sorts lexicographically
+before this one, by `partition_key`, plus this document's own line position
+within its partition's part-files concatenated in ascending `part_seq`
+order.* This is still fully deterministic (a pure function of phase-2's
+output and manifest, no wall-clock or process-scheduling dependency
+anywhere) — determinism is preserved, but the concrete integers assigned to
+any given document generally differ from what a hypothetical single-machine
+`inverted-index-builder` run over some arbitrary concatenation of the same
+documents would assign, unless that concatenation happens to use this exact
+partition order. This is expected and is exactly what
+`tests/test_index_pipeline.py::test_partitioned_index_matches_single_file_build_modulo_doc_ids`
+verifies: build the same small corpus two ways — (a) through this phase's
+map-reduce pipeline over ≥3 simulated partitions, and (b) as one concatenated
+`documents.jsonl` fed directly to `inverted-index-builder`'s own
+`IndexBuilder.build` — and assert the document *set* (by URL), the term
+vocabulary, and every term's per-document frequencies match exactly, while
+explicitly not asserting the numeric `doc_id` values match.
+
+### 5. Preserving the two consumers that already depend on `doc_id` resolution
+
+Two pieces of the ecosystem resolve `doc_id`s today, and do so by two
+different mechanisms — this phase had to check both, not assume the same fix
+covers both:
+
+**`pagerank-link-analysis`'s `JsonlDocumentIdResolver`**
+(`src/pagerank_link_analysis/document_resolver.py`) reads `inverted-index-builder`'s
+own `documents.jsonl` output and resolves by the explicit `"doc_id"` JSON
+field on each line — **not** by line position. It needed nothing special
+from this phase beyond a `documents.jsonl` where every `doc_id` is unique
+and the ID space is dense from `0` (its `total_documents = max_doc_id + 1`
+assumes no gaps). Both hold by construction here: ranges are disjoint
+(section 1) and packed with no gaps (`start` of each partition is exactly
+the `end` of the previous one, and `document_count` counts only actually-
+written documents, never a padded/reserved allocation). This consumer works
+unmodified against phase 3's merged `documents.jsonl`, with no deployment
+change beyond pointing it at that file instead of a single-machine one.
+
+**`beacon-search-console`'s `SnippetIndex`**
+(`backend/src/beacon_search_console/snippets.py`) is the harder case: unlike
+the resolver above, it resolves `doc_id → text` by **array position** in
+`html-content-extractor`'s *original* `documents.jsonl` (the one carrying
+`main_text`, which `inverted-index-builder`'s own output deliberately drops
+— see that module's docstring). Its documented contract, verbatim from
+`beacon-search-console`'s own `README.md` ("How it works", step 4), is
+`doc_id = line number` in whatever file it is pointed at — a positional
+contract with no explicit `doc_id` field to fall back on. Breaking this
+without an alternative would leave `beacon-search-console` unable to render
+result snippets at all in a later phase, which is exactly the risk this
+phase was asked to rule out, not just note.
+
+The fix requires no change to `beacon-search-console`'s code, because
+`SnippetIndex.from_documents_path` already takes an arbitrary `Path` — the
+positional contract is a property of *whichever file it's pointed at*, not
+of any specific filename. This phase produces exactly such a file:
+while materializing each partition's part-files for the map step (section
+2, step 1 — reading `main_text`-bearing `ExtractedDocument` records, not
+`inverted-index-builder`'s stripped-down `DocumentRecord`), `IndexingPipeline`
+also appends that same materialized partition, in the same ascending
+`partition_key` order used for range assignment, to one running global file
+(`corpus_object_key`, default `search-index/corpus/documents.jsonl`,
+uploaded via the same `ObjectStorage`). Because this file is assembled with
+*exactly* the same partition order and intra-partition order used to compute
+global `doc_id`s, line position in this file equals global `doc_id` by
+construction — the same guarantee `SnippetIndex` already relies on today,
+just computed across partitions instead of within one file. A later phase
+that stands up `beacon-search-console` against this pipeline's output only
+needs a deployment/configuration change — point `documents_path` at this
+corpus file instead of a single-process extractor's output — never a code
+change to `snippets.py`.
+
+### Known limitations
+
+- **The map step runs sequentially, in-process, over all partitions** — it
+  is designed to be embarrassingly parallel (section 2 explicitly notes each
+  partition's map step is an independent unit of work, same as phase 2's
+  extraction), but this phase does not actually distribute it across worker
+  processes the way `CrawlWorker`/`ExtractWorker` distribute across
+  replicas. Doing so would need the map step to be invokable standalone
+  (already true — `build_index_from_materialized_partition` takes a single
+  partition and an already-computed offset, no shared mutable state) plus a
+  coordinator that fans the N partition offsets out and collects N partial
+  indexes back, e.g. through the same `ObjectStorage` (each map worker
+  writes its remapped partial index with `write_index` to a scratch prefix;
+  a single reduce step reads them back with `read_index` and merges) instead
+  of the in-process list this phase currently keeps. Not implemented because
+  at this phase's target (a few million documents), a single process
+  building N partition-local indexes sequentially and merging them is not
+  the bottleneck the crawl or extraction stages are — revisit only if
+  profiling this phase against a real few-million-document corpus shows
+  otherwise.
+- **No incremental re-indexing.** Every run reads every partition from
+  scratch; there is no notion of indexing only documents written since the
+  last run. Acceptable for a bounded-domain, one-time-per-crawl corpus (the
+  same framing phase 0 already applies to the whole project); revisiting
+  this is only worth it for a corpus that is re-crawled and re-indexed on a
+  recurring schedule, which is out of this project's stated scope.
+- Same general principle phase 2 already applies (`ARCHITECTURE.md`, phase
+  2, section "Known limitations"): nothing in this phase aborts the whole
+  pipeline over one bad partition or one unreadable part-file — a partition
+  that cannot be read raises `IndexingError` with enough context to identify
+  which partition failed, rather than silently producing a global index
+  missing an unknown slice of the corpus.
+
+### Non-goals of phase 3
+
+This phase does not: change `inverted-index-builder`'s or
+`index-compression-codec`'s own algorithms or on-disk formats, run BM25 or
+PageRank scoring (that is `bm25-ranking-engine`/`pagerank-link-analysis`,
+consuming this phase's output through their own already-documented
+contracts), distribute the map step across worker processes (see "Known
+limitations" above), or support incremental/streaming index updates. It
+hands the next phase (distributed query serving /
+`distributed-index-sharding`) one global, compressed, correctly-doc_id'd
+index in object storage, plus a corpus file that keeps
+`beacon-search-console`'s snippet resolution working unmodified, to build
+on.

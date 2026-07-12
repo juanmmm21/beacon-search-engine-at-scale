@@ -18,16 +18,22 @@ Phase 1, built on top of that substrate, is the first real workload: a
 distributed web crawler that runs as N coordinated workers instead of one
 process. Phase 2, built on top of phase 1's output, turns those raw crawled
 pages into clean, indexable documents with N coordinated extraction workers
-consuming pages as the crawler produces them, not in a batch at the end. See
-[`ARCHITECTURE.md`](ARCHITECTURE.md) for the full reasoning behind every
-decision across all three phases, the alternatives considered, and how each
-piece of phase 0 is meant to evolve toward Kubernetes.
+consuming pages as the crawler produces them, not in a batch at the end.
+Phase 3, built on top of phase 2's partitioned output, is a one-shot
+map-reduce job that assigns a global, deterministic `doc_id` to every
+document and merges the whole corpus into a single inverted index, in the
+same on-disk format a single-machine `inverted-index-builder` run would
+produce. See [`ARCHITECTURE.md`](ARCHITECTURE.md) for the full reasoning
+behind every decision across all four phases, the alternatives considered,
+and how each piece of phase 0 is meant to evolve toward Kubernetes.
 
-This repo does not implement an indexer or a query server, and it does not
+This repo does not implement ranking or a query server, and it does not
 modify any of the ten existing `beacon-search-engine` repositories —
 `web-crawler-scheduler`'s own crawler logic (see "Distributed crawling
-(phase 1)" below) and `html-content-extractor`'s own extraction logic (see
-"Distributed extraction (phase 2)" below) are both reused as real package
+(phase 1)" below), `html-content-extractor`'s own extraction logic (see
+"Distributed extraction (phase 2)" below), and `inverted-index-builder`'s /
+`index-compression-codec`'s own indexing and compression logic (see
+"Distributed indexing (phase 3)" below) are all reused as real package
 dependencies, unchanged. It is a sibling repository that later phases
 extend.
 
@@ -85,7 +91,26 @@ beacon-search-engine-at-scale (this repo)
   └─────────────────────────────────────────────────────────┘
         |
         v
-  future phases: distributed indexing, distributed query serving —
+  ┌─────────────────────────────────────────────────────────┐
+  │  phase 3 — distributed indexing (one batch job, map-reduce) │
+  │                                                             │
+  │   doc_id  = contiguous per-partition range, from the       │
+  │             phase-2 manifest (no centralized counter)      │
+  │   map     = IndexBuilder.build per partition + remap        │
+  │   reduce  = merge.py concatenates disjoint, sorted          │
+  │             partial indexes (no merge-sort needed)          │
+  │   output  -> phase-0 ObjectStorage: search-index/           │
+  │              (inverted-index-builder format, unmodified),   │
+  │              search-index-compressed/ (index-compression-   │
+  │              codec, unmodified), search-index/corpus/       │
+  │              documents.jsonl (doc_id-aligned, for snippets) │
+  │                                                             │
+  │   indexing/compression logic reused unchanged from          │
+  │   inverted-index-builder and index-compression-codec        │
+  └─────────────────────────────────────────────────────────┘
+        |
+        v
+  future phases: distributed query serving —
   built on top of this substrate, not implemented in this repo yet
 ```
 
@@ -266,6 +291,49 @@ Same caveat as `crawl-worker`: `memory`/`local` backends never coordinate
 across separate process invocations, so this only makes sense for a single
 worker with no `docker compose` running.
 
+## Distributed indexing (phase 3)
+
+`src/beacon_scale_infra/index/` turns the documents phase 2 partitioned
+across N workers into a single global inverted index, in the exact on-disk
+format `inverted-index-builder` already defines and `index-compression-codec`
+already consumes. Unlike phases 1–2, this is a one-shot batch job
+(`build-index`), not a service you scale with `--scale`: it needs phase 2's
+manifest counts to be final before it can assign `doc_id`s (see
+[`ARCHITECTURE.md`](ARCHITECTURE.md), section "Phase 3 — Distributed
+indexing", for the full reasoning).
+
+| Concern | Single process (`inverted-index-builder`) | Distributed (this repo) |
+|---|---|---|
+| `doc_id` assignment | 0-based counter, line position in one `documents.jsonl` | contiguous per-partition range from the phase-2 manifest, offset added after building each partition locally |
+| Indexing logic | `IndexBuilder.build` | the same class, reused unchanged, once per partition (the *map* step) |
+| Combining results | N/A (one process) | `merge.py` concatenates already-sorted, disjoint partial indexes (the *reduce* step) — no merge-sort needed |
+| Output format | `write_index` (`manifest.json`, `documents.jsonl`, `postings.jsonl`, `stats.json`) | the same function, called once on the merged index |
+| Compression | `index-compression-codec`, run by hand afterward | the same package, invoked automatically at the end of the pipeline |
+
+It also writes one extra artifact with no equivalent in the single-machine
+pipeline: a global "corpus" file (`search-index/corpus/documents.jsonl` by
+default) carrying the full extracted text (`main_text` included, unlike
+`inverted-index-builder`'s own stripped-down `documents.jsonl`), assembled so
+that line position exactly equals global `doc_id`. This is what preserves
+`beacon-search-console`'s snippet resolution (`doc_id → text` by array
+position) across a corpus that no longer lives in one file — see
+`ARCHITECTURE.md`, phase 3, section 5.
+
+### Running it
+
+```bash
+python -m beacon_scale_infra build-index \
+  --storage-backend s3 --bucket beacon-scale-dev
+```
+
+Requires `BEACON_S3_ENDPOINT_URL`/`BEACON_S3_ACCESS_KEY`/`BEACON_S3_SECRET_KEY`
+(same variables as `crawl-worker`/`extract-worker` with `--storage-backend
+s3`) and phase 2's `extract-worker` replicas to have already finished. Add
+`--no-compress` to skip the `index-compression-codec` pass and inspect the
+uncompressed `search-index/` output directly. Without Docker, point
+`--storage-backend local --local-storage-root` at the same directory
+`extract-worker --storage-backend local` wrote to.
+
 ## Requirements and installation
 
 - Python `>=3.11`
@@ -338,6 +406,18 @@ object, message, or service instance, and prints every step.
   metadata)` — `ServiceRegistry.discover(service_name)` returns only
   instances whose liveness (TTL heartbeat locally, a Consul TTL health
   check for real) hasn't expired.
+- **The global index** (`search-index/` by default) is exactly
+  `inverted-index-builder`'s own on-disk format (`manifest.json`,
+  `documents.jsonl`, `postings.jsonl`, `stats.json`) — see that repo's own
+  `README.md` for the field-by-field contract. `doc_id` is no longer a line
+  position in a single file; see `ARCHITECTURE.md`, phase 3, section 4, for
+  the exact rule. The compressed variant
+  (`search-index-compressed/` by default) is `index-compression-codec`'s own
+  format, unmodified.
+- **The corpus file** (`search-index/corpus/documents.jsonl` by default)
+  carries the full `ExtractedDocument` fields (including `main_text`) phase
+  2 produced, one line per document, ordered so line position equals global
+  `doc_id` — see "Distributed indexing (phase 3)" above.
 
 ## Programmatic usage
 
@@ -440,6 +520,12 @@ predates a breaking constructor change in `aiohttp`'s `ClientResponse`).
   actually consumed messages; with very few pages in flight, one replica
   polling first can plausibly claim all of them (same dynamic already noted
   above for `crawl-worker` and a single seed domain).
+- **`build-index` produces an index with fewer documents than
+  `extracted-documents/manifest/` reports:** the manifest was still being
+  updated by a running `extract-worker` when `build-index` read it — this
+  phase requires phase 2 to have fully stopped first (see `ARCHITECTURE.md`,
+  phase 3, section 0); re-run `build-index` after confirming no
+  `extract-worker` replica is still consuming the extraction frontier.
 
 ## License
 
