@@ -2,16 +2,18 @@
 #
 # Levanta los tres servicios de sustrato decididos en ARCHITECTURE.md
 # (almacenamiento de objetos, cola de mensajes, registro de servicio), un
-# contenedor de arranque que crea el bucket de desarrollo, y el servicio
-# 'crawl-worker' de la fase 1 (crawl distribuido) -- nunca las 10 piezas de
-# dominio de beacon-search-engine, que no viven aquí (ver ARCHITECTURE.md,
-# sección "Por qué los diez repos originales no se tocan").
+# contenedor de arranque que crea el bucket de desarrollo, el servicio
+# 'crawl-worker' de la fase 1 (crawl distribuido) y el servicio
+# 'extract-worker' de la fase 2 (extracción distribuida) -- nunca las 10
+# piezas de dominio de beacon-search-engine, que no viven aquí (ver
+# ARCHITECTURE.md, sección "Por qué los diez repos originales no se tocan").
 #
 # Uso:
 #   docker compose up -d
-#   docker compose up -d --scale crawl-worker=4   # N workers de crawl compartiendo frontera
+#   docker compose up -d --scale crawl-worker=4 --scale extract-worker=4
 #   docker compose exec -it <servicio> ...   # inspección puntual
 #   docker compose logs -f crawl-worker            # ver qué worker crawlea qué URL
+#   docker compose logs -f extract-worker            # ver qué worker extrae qué página
 #   docker compose down -v                     # borra también los volúmenes de datos
 
 services:
@@ -112,6 +114,32 @@ services:
     # Un worker se detiene solo (código de salida 0) cuando la frontera se
     # agota -- ver CrawlWorkerConfig.idle_polls_before_shutdown. Reiniciar
     # solo ante un fallo real evita reiniciar en bucle un crawl ya terminado.
+    restart: on-failure
+
+  extract-worker:
+    build: .
+    depends_on:
+      minio-init:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    environment:
+      BEACON_S3_ENDPOINT_URL: http://minio:9000
+      BEACON_S3_ACCESS_KEY: beacon-dev
+      BEACON_S3_SECRET_KEY: beacon-dev-secret
+      BEACON_REDIS_URL: redis://redis:6379/0
+    command:
+      - extract-worker
+      - --queue-backend
+      - redis
+      - --storage-backend
+      - s3
+    networks: [beacon-scale]
+    # Sin --seed/BEACON_CRAWL_SEED_URLS: a diferencia de crawl-worker, este
+    # servicio no siembra nada -- solo consume los mensajes que crawl-worker
+    # publica en 'beacon-scale-extract-frontier' (ver crawl/worker.py,
+    # _write_page). Mismo criterio de apagado que crawl-worker: se detiene
+    # solo cuando esa cola lleva varios sondeos vacía.
     restart: on-failure
 
 networks:
