@@ -9,18 +9,22 @@ infrastructure instead of local processes.
 
 ## What this is
 
-This is phase 0 of that scale-up: before touching any crawling, indexing or
-ranking logic, this repository decides and builds the shared substrate every
-later phase will run on top of — object storage for raw pages, extracted
-documents and built indexes; a message queue for distributed crawl/indexing
-work; a service registry for dynamic shard discovery; and the development
-orchestration to run all of it locally. See [`ARCHITECTURE.md`](ARCHITECTURE.md)
-for the full reasoning behind each decision, the alternatives considered,
-and how each piece is meant to evolve toward Kubernetes.
+Phase 0 decided and built the shared substrate every later phase runs on top
+of, before touching any crawling, indexing or ranking logic — object storage
+for raw pages, extracted documents and built indexes; a message queue for
+distributed crawl/indexing work; a service registry for dynamic shard
+discovery; and the development orchestration to run all of it locally.
+Phase 1, built on top of that substrate, is the first real workload: a
+distributed web crawler that runs as N coordinated workers instead of one
+process. See [`ARCHITECTURE.md`](ARCHITECTURE.md) for the full reasoning
+behind every decision in both phases, the alternatives considered, and how
+each piece of phase 0 is meant to evolve toward Kubernetes.
 
-This repo does not implement a crawler, an indexer, or a query server, and
-it does not modify any of the ten existing `beacon-search-engine`
-repositories. It is a sibling repository that later phases extend.
+This repo does not implement an indexer or a query server, and it does not
+modify any of the ten existing `beacon-search-engine` repositories —
+`web-crawler-scheduler`'s own crawler logic is reused as a real package
+dependency, unchanged (see "Distributed crawling (phase 1)" below). It is a
+sibling repository that later phases extend.
 
 ## Role in `beacon-search-engine`
 
@@ -36,7 +40,7 @@ beacon-search-engine (10 repos, portfolio, closed scope)
         v
 beacon-search-engine-at-scale (this repo)
   ┌─────────────────────────────────────────────────────────┐
-  │                 shared infrastructure substrate           │
+  │  phase 0 — shared infrastructure substrate                 │
   │                                                             │
   │   ObjectStorage        MessageQueue        ServiceRegistry │
   │  (pages, docs,       (crawl frontier,      (dynamic shard  │
@@ -47,9 +51,22 @@ beacon-search-engine-at-scale (this repo)
   └─────────────────────────────────────────────────────────┘
         |
         v
-  future phases: distributed crawl, distributed indexing,
-  distributed query serving — built on top of this substrate,
-  not implemented in this repo yet
+  ┌─────────────────────────────────────────────────────────┐
+  │  phase 1 — distributed crawling (N CrawlWorker replicas)   │
+  │                                                             │
+  │   frontier = phase-0 MessageQueue (shared, not per-worker) │
+  │   dedup    = SharedDeduplicator   (Redis SET, atomic claim)│
+  │   rate limit = CoordinatedRateLimiter (Redis, per-domain)  │
+  │   pages    -> phase-0 ObjectStorage, partitioned by         │
+  │               date + URL-hash shard                        │
+  │                                                             │
+  │   crawl logic reused unchanged from web-crawler-scheduler: │
+  │   AiohttpFetcher, RobotsCache, extract_outlinks             │
+  └─────────────────────────────────────────────────────────┘
+        |
+        v
+  future phases: distributed indexing, distributed query serving —
+  built on top of this substrate, not implemented in this repo yet
 ```
 
 ## Goal and skills demonstrated
@@ -97,6 +114,74 @@ short:
 | Service registry | `InMemoryServiceRegistry` | `ConsulServiceRegistry` |
 | Orchestration | `docker-compose.yml` | Kubernetes (`Deployment`/`StatefulSet` per service — documented, not implemented here) |
 
+## Distributed crawling (phase 1)
+
+`src/beacon_scale_infra/crawl/` orchestrates several `CrawlWorker` instances
+that share a frontier, a deduplication set and per-domain rate limits
+through the phase-0 substrate, instead of each worker keeping that state to
+itself the way `web-crawler-scheduler`'s single-process `CrawlPipeline`
+does. See [`ARCHITECTURE.md`](ARCHITECTURE.md), section "Phase 1 —
+Distributed crawling", for the full reasoning; in short:
+
+| Concern | Single process (`web-crawler-scheduler`) | Distributed (this repo) |
+|---|---|---|
+| Frontier | `PriorityFrontier` (in-memory heap) | phase-0 `MessageQueue` (Redis Streams stream, FIFO) |
+| Deduplication | `HashSetDeduplicator` (`seen()` + `mark_seen()`) | `SharedDeduplicator.try_claim()` (atomic `SADD`) |
+| Rate limiting | `DomainRateLimiter` (per-process) | `CoordinatedRateLimiter` (Redis delay gate + lease semaphore) |
+| Fetching, robots.txt, link extraction | `AiohttpFetcher`, `RobotsCache`, `extract_outlinks` | the same classes, reused unchanged as a package dependency |
+| Raw page storage | local JSONL files | phase-0 `ObjectStorage`, partitioned by date + URL-hash shard |
+
+Every `CrawlWorker` dependency is a protocol (`MessageQueue`, `ObjectStorage`,
+`SharedDeduplicator`, `CoordinatedRateLimiter`, plus `web-crawler-scheduler`'s
+own `PageFetcher`/`RobotsPolicy`) — the worker itself never picks a concrete
+backend; whoever constructs it does (see `__main__.py`'s `crawl-worker`
+subcommand).
+
+### Launching N workers locally
+
+```bash
+docker compose up -d                              # MinIO, Redis, Consul, bucket bootstrap
+BEACON_CRAWL_SEED_URLS=https://example.com/ \
+docker compose up -d --scale crawl-worker=4        # 4 workers sharing one frontier
+docker compose logs -f crawl-worker
+```
+
+Each replica gets a distinct container hostname, which `CrawlWorker` uses as
+its `--worker-id` by default — no per-replica configuration needed, and no
+separate seeding step: every worker publishes the seed URLs on startup, and
+the atomic claim in `SharedDeduplicator` makes the redundant publishes from
+the other replicas harmless (see `CrawlWorker._seed_frontier`'s docstring).
+Workers stop on their own once the frontier has been idle for a few
+consecutive polls — `docker compose ps` will show `crawl-worker` replicas
+exit with code `0` once a bounded-domain crawl finishes.
+
+To see the frontier actually split across workers rather than one replica
+doing all the work, inspect the pages each one wrote — every stored
+`CrawledPageRecord` carries a `fetched_by_worker` field:
+
+```bash
+docker compose exec minio mc alias set local http://localhost:9000 beacon-dev beacon-dev-secret
+docker compose exec minio mc find local/beacon-scale-dev/crawl-pages --exec \
+  "mc cat {} | python3 -c 'import json,sys; print(json.load(sys.stdin)[\"fetched_by_worker\"])'"
+```
+
+Different worker IDs appearing across that output is the frontier sharing
+working as intended: no single worker owns the whole crawl.
+
+### Running a single worker without Docker
+
+For a quick smoke test with no infrastructure running at all, use the
+in-memory/local backends (this only makes sense for one worker per process —
+`memory`/`local` backends never coordinate across separate `python -m`
+invocations):
+
+```bash
+BEACON_CRAWL_SEED_URLS=https://example.com/ \
+python -m beacon_scale_infra crawl-worker \
+  --queue-backend memory --storage-backend local --coordination-backend memory \
+  --local-storage-root .local-object-storage --idle-polls-before-shutdown 3
+```
+
 ## Requirements and installation
 
 - Python `>=3.11`
@@ -118,12 +203,17 @@ docker compose up -d
 This starts MinIO (API on `:9000`, console on `:9001`), Redis with AOF
 persistence (`:6379`) and a single Consul dev agent (API/UI on `:8500`), and
 creates the `beacon-scale-dev` bucket automatically via a bootstrap
-container.
+container. `docker compose up -d --scale crawl-worker=N` additionally builds
+the `crawl-worker` image from this repo's `Dockerfile` and needs network
+access at build time to install `web-crawler-scheduler` from its Git URL
+(see `pyproject.toml`).
 
 ## CLI usage
 
-A demonstration CLI exercises each piece of the substrate end to end,
-against either backend:
+This section covers the phase-0 substrate demo commands
+(`storage-demo`/`queue-demo`/`registry-demo`); see "Distributed crawling
+(phase 1)" above for `crawl-worker`. A demonstration CLI exercises each
+piece of the substrate end to end, against either backend:
 
 ```bash
 # Local backends, no Docker required
@@ -233,6 +323,23 @@ predates a breaking constructor change in `aiohttp`'s `ClientResponse`).
 - **`mypy` complains about `mypy_boto3_s3`/`boto3-stubs` imports:** those are
   a `dev` extra, used only under `TYPE_CHECKING` — install with
   `pip install -e ".[dev]"`, not just the base package.
+- **`crawl-worker` exits immediately with "no se especificaron URLs
+  semilla":** pass at least one `--seed`, or set `BEACON_CRAWL_SEED_URLS`
+  (comma-separated) — a worker with no seeds and an empty frontier has
+  nothing to do and shuts down on its first idle poll.
+- **`docker compose up -d --scale crawl-worker=N` only ever shows one
+  replica doing work:** with `default_min_delay_seconds` at its default
+  (`1.0`) and a single seed domain, the very first page is claimed by
+  whichever replica happens to poll first — that is expected for a tiny
+  site with only a handful of pages. Point `BEACON_CRAWL_SEED_URLS` at a
+  site with more outlinks per page, or check `fetched_by_worker` across a
+  longer-running crawl before concluding the frontier isn't splitting.
+- **A `crawl-worker` replica that was killed mid-page never gets its
+  in-flight URL retried by another replica:** Redis Streams pending entries
+  are not reclaimed (`XCLAIM`) in this phase — same limitation already
+  documented above for `queue-demo --backend redis`, now visible under real
+  crawl load too (see `ARCHITECTURE.md`, phase 1, "Known limitation carried
+  over from phase 0").
 
 ## License
 
