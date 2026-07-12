@@ -16,6 +16,8 @@ dependencies = [
     "aiohttp>=3.9,<4",
     "web-crawler-scheduler @ git+https://github.com/juanmmm21/web-crawler-scheduler.git@main",
     "html-content-extractor @ git+https://github.com/juanmmm21/html-content-extractor.git@main",
+    "inverted-index-builder @ git+https://github.com/juanmmm21/inverted-index-builder.git@main",
+    "index-compression-codec @ git+https://github.com/juanmmm21/index-compression-codec.git@main",
 ]
 
 [project.scripts]
@@ -76,4 +78,18 @@ ignore_missing_imports = true
 # publica un marcador py.typed en su distribución instalada, pese a pasar
 # mypy --strict dentro de su propio repo.
 module = "html_content_extractor.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+# Mismo caso que web-crawler-scheduler/html-content-extractor arriba:
+# inverted-index-builder tampoco publica un marcador py.typed en su
+# distribución instalada, pese a pasar mypy --strict dentro de su propio repo.
+module = "inverted_index_builder.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+# Mismo caso que el resto de dependencias del ecosistema arriba:
+# index-compression-codec tampoco publica un marcador py.typed en su
+# distribución instalada, pese a pasar mypy --strict dentro de su propio repo.
+module = "index_compression_codec.*"
 ignore_missing_imports = true
