@@ -30,3 +30,11 @@ class MessageQueueError(BeaconScaleInfraError):
 
 class ServiceRegistryError(BeaconScaleInfraError):
     """Fallo al registrar, dar de baja o descubrir instancias de un servicio."""
+
+
+class SharedDeduplicatorError(BeaconScaleInfraError):
+    """Fallo al reclamar o consultar una URL en el deduplicador compartido."""
+
+
+class CoordinatedRateLimiterError(BeaconScaleInfraError):
+    """Fallo al adquirir o liberar un hueco del rate limiter coordinado."""
