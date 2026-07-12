@@ -46,3 +46,11 @@ class IndexingError(BeaconScaleInfraError):
     o una colisión de `doc_id` entre particiones tras el remapeo -- nunca se
     deja escapar la excepción cruda de `inverted-index-builder` ni de
     `index-compression-codec` sin envolver (ver `ARCHITECTURE.md`, fase 3)."""
+
+
+class PageRankPhaseError(BeaconScaleInfraError):
+    """Fallo del pipeline de PageRank distribuido (fase 4): imposible
+    descargar `search-index/documents.jsonl` de fase 3, o el grafo de enlaces
+    materializado queda vacío pese a que `crawl-pages/` no lo está -- nunca se
+    deja escapar la excepción cruda de `pagerank-link-analysis` sin envolver
+    (ver `ARCHITECTURE.md`, fase 4)."""
