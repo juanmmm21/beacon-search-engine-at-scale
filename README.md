@@ -16,15 +16,20 @@ distributed crawl/indexing work; a service registry for dynamic shard
 discovery; and the development orchestration to run all of it locally.
 Phase 1, built on top of that substrate, is the first real workload: a
 distributed web crawler that runs as N coordinated workers instead of one
-process. See [`ARCHITECTURE.md`](ARCHITECTURE.md) for the full reasoning
-behind every decision in both phases, the alternatives considered, and how
-each piece of phase 0 is meant to evolve toward Kubernetes.
+process. Phase 2, built on top of phase 1's output, turns those raw crawled
+pages into clean, indexable documents with N coordinated extraction workers
+consuming pages as the crawler produces them, not in a batch at the end. See
+[`ARCHITECTURE.md`](ARCHITECTURE.md) for the full reasoning behind every
+decision across all three phases, the alternatives considered, and how each
+piece of phase 0 is meant to evolve toward Kubernetes.
 
 This repo does not implement an indexer or a query server, and it does not
 modify any of the ten existing `beacon-search-engine` repositories —
-`web-crawler-scheduler`'s own crawler logic is reused as a real package
-dependency, unchanged (see "Distributed crawling (phase 1)" below). It is a
-sibling repository that later phases extend.
+`web-crawler-scheduler`'s own crawler logic (see "Distributed crawling
+(phase 1)" below) and `html-content-extractor`'s own extraction logic (see
+"Distributed extraction (phase 2)" below) are both reused as real package
+dependencies, unchanged. It is a sibling repository that later phases
+extend.
 
 ## Role in `beacon-search-engine`
 
@@ -62,6 +67,21 @@ beacon-search-engine-at-scale (this repo)
   │                                                             │
   │   crawl logic reused unchanged from web-crawler-scheduler: │
   │   AiohttpFetcher, RobotsCache, extract_outlinks             │
+  └─────────────────────────────────────────────────────────┘
+        |
+        v
+  ┌─────────────────────────────────────────────────────────┐
+  │  phase 2 — distributed extraction (N ExtractWorker replicas)│
+  │                                                             │
+  │   trigger  = phase-0 MessageQueue (CrawlWorker publishes   │
+  │              a job per page, ExtractWorker consumes it)    │
+  │   no dedup / rate limiter needed -- every page independent │
+  │   documents -> phase-0 ObjectStorage, partitioned by        │
+  │                worker_id, plus a partitioned manifest       │
+  │                                                             │
+  │   extraction logic reused unchanged from                   │
+  │   html-content-extractor: resolve_encoding, parse_html,    │
+  │   extract_main_content, extract_metadata, normalize_text   │
   └─────────────────────────────────────────────────────────┘
         |
         v
@@ -182,6 +202,70 @@ python -m beacon_scale_infra crawl-worker \
   --local-storage-root .local-object-storage --idle-polls-before-shutdown 3
 ```
 
+## Distributed extraction (phase 2)
+
+`src/beacon_scale_infra/extract/` orchestrates several `ExtractWorker`
+instances that turn the raw pages phase 1 wrote into clean, indexable
+documents — consuming pages *as the crawler produces them*, through a queue
+`CrawlWorker` publishes to, rather than reading a `pages.jsonl` in one batch
+the way `html-content-extractor`'s single-process `ExtractionPipeline` does.
+See [`ARCHITECTURE.md`](ARCHITECTURE.md), section "Phase 2 — Distributed
+extraction", for the full reasoning; in short:
+
+| Concern | Single process (`html-content-extractor`) | Distributed (this repo) |
+|---|---|---|
+| Trigger | reads a whole `pages.jsonl` at once | `CrawlWorker` publishes one job per page, as it's crawled |
+| Coordination between workers | N/A (one process) | none needed — every page is independent, only the phase-0 `MessageQueue`'s consumer groups split the work |
+| Extraction logic | `ExtractionPipeline` (encoding, parsing, density, metadata, normalization) | the same underlying functions, reused unchanged as a package dependency |
+| Document storage | two local files (`documents.jsonl`, `discarded.jsonl`) | phase-0 `ObjectStorage`, partitioned by `worker_id` into many immutable part files |
+| Knowing what was written | read the files directly | a partitioned manifest (`extract/manifest.py`), aggregated across all partitions on read |
+
+Unlike `CrawlWorker`, `ExtractWorker` needs no deduplicator and no rate
+limiter: extracting an already-downloaded page makes no outbound request
+and shares no resource with extracting any other page — the easiest stage
+of the whole pipeline to parallelize. Every `ExtractWorker` dependency is a
+protocol (`MessageQueue`, `ObjectStorage`) — same pattern as `CrawlWorker`;
+whoever constructs it (`__main__.py`'s `extract-worker` subcommand) decides
+the concrete backend.
+
+### Launching N workers locally
+
+```bash
+docker compose up -d                                     # MinIO, Redis, Consul, bucket bootstrap
+BEACON_CRAWL_SEED_URLS=https://example.com/ \
+docker compose up -d --scale crawl-worker=4 --scale extract-worker=4
+docker compose logs -f extract-worker
+```
+
+Each replica gets a distinct container hostname, used as `--worker-id` by
+default — the same default `CrawlWorker` uses, and for the same reason: no
+per-replica configuration needed, and a restarted container gets a fresh
+partition instead of reusing (and colliding with) a previous one (see
+`ARCHITECTURE.md`, phase 2, "Known limitations"). `extract-worker` needs no
+seed URLs of its own — it only reacts to jobs `crawl-worker` publishes.
+
+To see documents actually split across workers, inspect the manifest
+fragments each one wrote:
+
+```bash
+docker compose exec minio mc alias set local http://localhost:9000 beacon-dev beacon-dev-secret
+docker compose exec minio mc cat local/beacon-scale-dev/extracted-documents/manifest/partition=<worker-id>.json
+```
+
+Different `worker-id` fragments appearing under `extracted-documents/manifest/`
+is the extraction work sharing as intended.
+
+### Running a single worker without Docker
+
+```bash
+python -m beacon_scale_infra extract-worker \
+  --queue-backend memory --storage-backend local \
+  --local-storage-root .local-object-storage --idle-polls-before-shutdown 3
+```
+Same caveat as `crawl-worker`: `memory`/`local` backends never coordinate
+across separate process invocations, so this only makes sense for a single
+worker with no `docker compose` running.
+
 ## Requirements and installation
 
 - Python `>=3.11`
@@ -203,17 +287,19 @@ docker compose up -d
 This starts MinIO (API on `:9000`, console on `:9001`), Redis with AOF
 persistence (`:6379`) and a single Consul dev agent (API/UI on `:8500`), and
 creates the `beacon-scale-dev` bucket automatically via a bootstrap
-container. `docker compose up -d --scale crawl-worker=N` additionally builds
-the `crawl-worker` image from this repo's `Dockerfile` and needs network
-access at build time to install `web-crawler-scheduler` from its Git URL
-(see `pyproject.toml`).
+container. `docker compose up -d --scale crawl-worker=N --scale
+extract-worker=M` additionally builds the shared `crawl-worker`/`extract-worker`
+image from this repo's `Dockerfile` and needs network access at build time
+to install `web-crawler-scheduler` and `html-content-extractor` from their
+Git URLs (see `pyproject.toml`).
 
 ## CLI usage
 
 This section covers the phase-0 substrate demo commands
 (`storage-demo`/`queue-demo`/`registry-demo`); see "Distributed crawling
-(phase 1)" above for `crawl-worker`. A demonstration CLI exercises each
-piece of the substrate end to end, against either backend:
+(phase 1)" above for `crawl-worker` and "Distributed extraction (phase 2)"
+above for `extract-worker`. A demonstration CLI exercises each piece of the
+substrate end to end, against either backend:
 
 ```bash
 # Local backends, no Docker required
@@ -340,6 +426,20 @@ predates a breaking constructor change in `aiohttp`'s `ClientResponse`).
   documented above for `queue-demo --backend redis`, now visible under real
   crawl load too (see `ARCHITECTURE.md`, phase 1, "Known limitation carried
   over from phase 0").
+- **`extract-worker` reports `pages_missing > 0`:** it consumed a job
+  referencing a page that no longer exists at that `(bucket, key)` in object
+  storage — either the `publish` after a `put_object` raced ahead of
+  eventual consistency (unlikely against MinIO/S3, which are read-after-write
+  consistent for new keys) or the object was deleted out-of-band. The worker
+  logs the missing key and moves on; see `ARCHITECTURE.md`, phase 2, "Known
+  limitations".
+- **`extracted-documents/manifest/` only shows fragments for some of the
+  `extract-worker` replicas:** a replica that never received any job from
+  the shared queue never flushes and therefore never writes its manifest
+  fragment — check `docker compose logs extract-worker` for which replicas
+  actually consumed messages; with very few pages in flight, one replica
+  polling first can plausibly claim all of them (same dynamic already noted
+  above for `crawl-worker` and a single seed domain).
 
 ## License
 

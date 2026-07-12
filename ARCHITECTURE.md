@@ -350,3 +350,146 @@ whole cluster (`CrawlWorkerConfig.max_pages` is a per-worker cap, not a
 cluster-wide one — see its docstring for why), or reclaim a crashed worker's
 pending queue entries automatically. It hands the next phase (distributed
 indexing) a corpus of raw, partitioned pages in object storage to build on.
+
+## Phase 2 — Distributed extraction
+
+This phase extends the phase-0 substrate with the second domain workload:
+turning the raw, partitioned pages phase 1 wrote into object storage into
+clean, indexable documents, with several worker processes running
+concurrently, each one consuming pages *as the crawler produces them* rather
+than in one batch after the crawl finishes.
+
+`html-content-extractor` (one of the ten original `beacon-search-engine`
+repositories) already implements the extraction logic itself — encoding
+correction, tolerant DOM parsing, the text-density boilerplate-removal
+heuristic, metadata extraction, Unicode normalization — for a single process
+reading one `pages.jsonl` file to completion. That repository stays
+untouched (see "Why the ten original repos stay untouched" above): this
+phase reuses its per-stage functions (`resolve_encoding`, `parse_html`,
+`extract_main_content`, `extract_metadata`, `normalize_text`) as a real
+package dependency (pinned Git URL in `pyproject.toml`, same pattern as
+phase 1 with `web-crawler-scheduler`), through `extract_single_page`
+(`src/beacon_scale_infra/extract/page_extractor.py`) — a function that
+processes one already-deserialized page and returns one result, instead of
+`html_content_extractor.pipeline.ExtractionPipeline`, which is deliberately
+coupled to opening two output files and reading one input file to exhaustion
+in a single process. What this phase adds is the orchestration between
+several workers over individual queue messages, not the extraction logic
+itself — exactly the same shape of integration phase 1 already used for
+`web-crawler-scheduler`.
+
+### 1. Producer/consumer wiring — `CrawlWorker` publishes, `ExtractWorker` consumes
+
+Phase 1's `CrawlWorker._write_page` now does one thing in addition to the
+`put_object` it already did: after the page lands in object storage, it
+publishes a small message (`{"bucket": ..., "key": ...}`) to a second
+phase-0 `MessageQueue` stream (`beacon-scale-extract-frontier` by default,
+`CrawlWorkerConfig.extract_stream`) — never the frontier stream itself, a
+distinct one. This is the *only* way phase 2 learns that a new page exists:
+there is no polling of object storage, no timer, no listing. A payload
+carries a storage reference, not the page body — the HTML already lives in
+object storage exactly for this reason, and copying it again into Redis
+would waste the message queue's memory on data already durably stored
+elsewhere.
+
+The two worker types are wired through a plain `dict` payload, not a shared
+Python import between `crawl/` and `extract/`: `crawl/worker.py` never
+imports anything from `beacon_scale_infra.extract`, so a change to phase 2's
+internals never has to touch phase 1's module. The contract between them is
+the serialized message shape itself — the same principle the whole
+`beacon-search-engine` ecosystem already applies between repos (see
+`~/Desarrollo/beacon-search-engine/CLAUDE.md`), applied here one level down,
+between two phases of the same repo.
+
+### 2. No coordination between extraction workers — the easiest stage to parallelize
+
+Unlike phase 1, `ExtractWorker` needs no `SharedDeduplicator` and no
+`CoordinatedRateLimiter` equivalent. Both of those exist in phase 1 because
+several crawl jobs can target the *same* URL or the *same* domain at the
+same time, and something has to arbitrate that shared resource. Extraction
+has no such resource: each `ExtractJob` references a page that was already
+downloaded once, already lives at a unique object-storage key, and produces
+an output that depends on nothing outside that one page. The only shared
+state between `ExtractWorker` replicas is the phase-0 `MessageQueue`'s
+consumer-group semantics — the same mechanism that already splits the crawl
+frontier across `CrawlWorker` replicas in phase 1 — which is sufficient on
+its own to guarantee that N workers process disjoint messages without ever
+talking to each other.
+
+### 3. Extracted documents — partitioned by worker, not by hash shard
+
+Unlike phase 1's raw pages (partitioned by date + URL-hash shard, because
+*every* `CrawlWorker` can write a page for any date/shard combination and
+those need to be spread evenly), extracted documents are partitioned by
+`worker_id` (`src/beacon_scale_infra/extract/partitioning.py`): each
+`ExtractWorker` owns one partition for its entire run and never writes
+outside it. No hash function is needed to keep two workers from colliding —
+they simply never share a key prefix. Within its own partition, a worker
+never overwrites a previous write: `ObjectStorage.put_object` has no native
+*append*, so accumulating ever more documents into one growing key would
+retransmit the whole partition's content on every flush, a quadratic cost
+at this phase's target scale (a few million pages). Instead, each flush
+(every `flush_every_pages` processed pages, plus once more at shutdown)
+writes a new, immutable part file (`documents-NNNNNN.jsonl` /
+`discarded-NNNNNN.jsonl`) — the same shape Spark/Hive use for partitioned
+output.
+
+### 4. The manifest — itself partitioned, for the same reason
+
+The next phase (distributed indexing) needs to know which partitions exist
+and how many documents each one has, without listing and counting every
+part file at startup. `src/beacon_scale_infra/extract/manifest.py` gives it
+that as a small, aggregated view — but the manifest that indexing reads is,
+underneath, exactly as distributed as the partitions it describes: each
+`ExtractWorker` owns one manifest *fragment*
+(`manifest/partition=<worker_id>.json`), overwritten with updated running
+totals on every flush, and never reads or writes any other worker's
+fragment. Overwriting is cheap here (unlike a part file) because a fragment
+is a handful of counters, not document content. `read_manifest` reconstructs
+the aggregate manifest by listing the `manifest/` prefix
+(`ObjectStorage.list_objects` already streams rather than buffering a whole
+bucket, see `protocols.py`) and summing each fragment — no locking, no
+compare-and-swap, no coordination between workers is needed to keep this
+consistent, for the same reason section 2 above gives: nothing here is
+shared.
+
+### Known limitations
+
+- **A `put_object` that succeeds followed by a `publish` that fails leaves a
+  page stuck in storage, never extracted.** `_write_page` does the two
+  calls sequentially with no compensating transaction; a page in this state
+  is invisible to phase 2 forever, with no automatic reconciliation in this
+  phase (a future phase could add a periodic sweep comparing
+  `crawl-pages/` against the manifest, but that is out of scope here).
+- **`ExtractWorker` handles a missing referenced page (`ObjectNotFoundError`)
+  by counting it and moving on** (`ExtractWorkerStats.pages_missing`), never
+  by retrying or crashing — the same "never lose a page in silence, but
+  never abort the batch for one bad page" principle
+  `~/Desarrollo/beacon-search-engine/CLAUDE.md` already requires for
+  malformed HTML, applied here to a missing object instead.
+- **A worker that restarts under the same `worker_id` resets its part-file
+  sequence counter to zero, and could overwrite `documents-000000.jsonl`
+  from its previous run.** In practice this risk is already mitigated by
+  the same design choice phase 1 made for `CrawlWorker`: `--worker-id`
+  defaults to the container hostname, and a restarted container under
+  `docker compose up -d --scale` gets a new one, not a reused one — see
+  phase 1, section 5. A deployment that pins a stable, reused `worker_id`
+  across restarts (e.g. a Kubernetes `StatefulSet` pod name) would need to
+  persist the sequence counter externally to avoid this; not needed at this
+  phase's `docker-compose` orchestration.
+- Same Redis Streams limitation carried over from phase 0 and phase 1:
+  pending entries for a worker that crashes mid-message are never reclaimed
+  (`XCLAIM`).
+
+### Non-goals of phase 2
+
+This phase does not: build an inverted index of any kind (that is the next
+phase, distributed indexing, extending `inverted-index-builder`), merge the
+per-worker partitions into a single `documents.jsonl` (the manifest gives
+indexing everything it needs to read all partitions without that merge
+step), reconcile pages that were stored but never got their extraction job
+published, or decide a global document budget across the whole cluster
+(`ExtractWorkerConfig.max_pages` is a per-worker cap, same reasoning as
+`CrawlWorkerConfig.max_pages` in phase 1). It hands the next phase a corpus
+of clean, partitioned documents in object storage, plus a manifest
+describing exactly where to find them, to build on.
