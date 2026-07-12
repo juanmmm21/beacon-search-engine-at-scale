@@ -8,6 +8,11 @@ Redis, Consul), seleccionable con `--backend`.
 Fase 1 (`crawl-worker`): arranca un worker de crawl distribuido (bloqueante,
 pensado para correr como servicio de `docker-compose`, escalable a N
 réplicas -- ver README, sección "Lanzar varios workers").
+
+Fase 2 (`extract-worker`): arranca un worker de extracción distribuido
+(bloqueante, mismo patrón de servicio escalable que `crawl-worker`, pero sin
+`--coordination-backend`: la extracción no necesita deduplicador ni rate
+limiter compartidos, ver `extract/worker.py`).
 """
 
 from __future__ import annotations
@@ -22,6 +27,7 @@ from pathlib import Path
 
 import aiohttp
 import redis.asyncio as redis_asyncio
+from html_content_extractor.models import ExtractionConfig
 from web_crawler_scheduler.fetcher import AiohttpFetcher
 from web_crawler_scheduler.robots import RobotsCache
 
@@ -34,6 +40,8 @@ from beacon_scale_infra.crawl.rate_limiter import (
 )
 from beacon_scale_infra.crawl.worker import CrawlWorker
 from beacon_scale_infra.errors import BeaconScaleInfraError
+from beacon_scale_infra.extract.models import ExtractWorkerConfig
+from beacon_scale_infra.extract.worker import ExtractWorker
 from beacon_scale_infra.models import ServiceInstance
 from beacon_scale_infra.protocols import MessageQueue, ObjectStorage, ServiceRegistry
 from beacon_scale_infra.queue.memory import InMemoryMessageQueue
@@ -130,6 +138,45 @@ def _build_parser() -> argparse.ArgumentParser:
         "--obey-robots-txt", action=argparse.BooleanOptionalAction, default=True
     )
     crawl_worker_parser.add_argument(
+        "--local-storage-root", type=Path, default=Path(".local-object-storage")
+    )
+
+    extract_worker_parser = subparsers.add_parser(
+        "extract-worker",
+        help="Arranca un worker de extracción distribuido que consume páginas crawleadas",
+    )
+    extract_worker_parser.add_argument(
+        "--worker-id",
+        default=None,
+        help="Identificador de este worker, y clave de su partición de documentos extraídos "
+        "(por defecto, el hostname del contenedor -- distinto por réplica bajo "
+        "'docker compose up --scale')",
+    )
+    extract_worker_parser.add_argument(
+        "--queue-backend", choices=["memory", "redis"], default="redis"
+    )
+    extract_worker_parser.add_argument("--storage-backend", choices=["local", "s3"], default="s3")
+    extract_worker_parser.add_argument("--bucket", default="beacon-scale-dev")
+    extract_worker_parser.add_argument("--object-key-prefix", default="extracted-documents")
+    extract_worker_parser.add_argument("--stream", default="beacon-scale-extract-frontier")
+    extract_worker_parser.add_argument("--group", default="beacon-scale-extract-workers")
+    extract_worker_parser.add_argument("--min-main-content-chars", type=int, default=200)
+    extract_worker_parser.add_argument("--min-block-text-chars", type=int, default=25)
+    extract_worker_parser.add_argument("--link-density-threshold", type=float, default=0.5)
+    extract_worker_parser.add_argument("--flush-every-pages", type=int, default=50)
+    extract_worker_parser.add_argument("--max-pages", type=int, default=None)
+    extract_worker_parser.add_argument(
+        "--idle-polls-before-shutdown",
+        type=int,
+        default=6,
+        help="Sondeos consecutivos sin trabajo nuevo antes de detenerse",
+    )
+    extract_worker_parser.add_argument(
+        "--no-idle-shutdown",
+        action="store_true",
+        help="No detenerse nunca al quedarse sin trabajo (servicio de larga duración)",
+    )
+    extract_worker_parser.add_argument(
         "--local-storage-root", type=Path, default=Path(".local-object-storage")
     )
 
@@ -341,6 +388,56 @@ async def _run_crawl_worker(args: argparse.Namespace) -> None:
         await coordination_client.aclose()
 
 
+async def _run_extract_worker(args: argparse.Namespace) -> None:
+    worker_id = args.worker_id or socket.gethostname()
+    config = ExtractWorkerConfig(
+        worker_id=worker_id,
+        stream=args.stream,
+        group=args.group,
+        bucket=args.bucket,
+        object_key_prefix=args.object_key_prefix,
+        extraction_config=ExtractionConfig(
+            min_main_content_chars=args.min_main_content_chars,
+            min_block_text_chars=args.min_block_text_chars,
+            link_density_threshold=args.link_density_threshold,
+        ),
+        flush_every_pages=args.flush_every_pages,
+        max_pages=args.max_pages,
+        idle_polls_before_shutdown=(
+            None if args.no_idle_shutdown else args.idle_polls_before_shutdown
+        ),
+    )
+
+    queue: MessageQueue
+    if args.queue_backend == "memory":
+        queue = InMemoryMessageQueue()
+    else:
+        queue = RedisStreamsMessageQueue.from_url(
+            os.environ.get("BEACON_REDIS_URL", "redis://localhost:6379/0")
+        )
+
+    storage: ObjectStorage
+    if args.storage_backend == "local":
+        storage = LocalFilesystemObjectStorage(args.local_storage_root)
+    else:
+        storage = S3ObjectStorage(
+            endpoint_url=_require_env("BEACON_S3_ENDPOINT_URL"),
+            access_key=_require_env("BEACON_S3_ACCESS_KEY"),
+            secret_key=_require_env("BEACON_S3_SECRET_KEY"),
+            region_name=os.environ.get("BEACON_S3_REGION", "us-east-1"),
+        )
+
+    worker = ExtractWorker(config, queue=queue, storage=storage)
+    print(f"[extract-worker:{worker_id}] arrancando")
+    stats = await worker.run()
+    print(f"[extract-worker:{worker_id}] terminado: {stats}")
+
+    if isinstance(storage, S3ObjectStorage):
+        await storage.aclose()
+    if isinstance(queue, RedisStreamsMessageQueue):
+        await queue.aclose()
+
+
 async def _dispatch(args: argparse.Namespace) -> None:
     if args.command == "storage-demo":
         await _run_storage_demo(args)
@@ -350,6 +447,8 @@ async def _dispatch(args: argparse.Namespace) -> None:
         await _run_registry_demo(args)
     elif args.command == "crawl-worker":
         await _run_crawl_worker(args)
+    elif args.command == "extract-worker":
+        await _run_extract_worker(args)
     else:  # pragma: no cover - argparse restringe 'command' a los subparsers de arriba
         raise AssertionError(f"comando desconocido: {args.command}")
 
