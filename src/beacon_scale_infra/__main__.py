@@ -13,6 +13,11 @@ Fase 2 (`extract-worker`): arranca un worker de extracción distribuido
 (bloqueante, mismo patrón de servicio escalable que `crawl-worker`, pero sin
 `--coordination-backend`: la extracción no necesita deduplicador ni rate
 limiter compartidos, ver `extract/worker.py`).
+
+Fase 3 (`build-index`): ejecuta el pipeline de indexación distribuida una
+única vez (job por lotes, no un servicio escalable a réplicas como los dos
+comandos anteriores -- ver `ARCHITECTURE.md`, fase 3, sección 0), después de
+que la fase 2 haya terminado de escribir todas sus particiones.
 """
 
 from __future__ import annotations
@@ -42,6 +47,8 @@ from beacon_scale_infra.crawl.worker import CrawlWorker
 from beacon_scale_infra.errors import BeaconScaleInfraError
 from beacon_scale_infra.extract.models import ExtractWorkerConfig
 from beacon_scale_infra.extract.worker import ExtractWorker
+from beacon_scale_infra.index.models import IndexingPipelineConfig
+from beacon_scale_infra.index.pipeline import IndexingPipeline
 from beacon_scale_infra.models import ServiceInstance
 from beacon_scale_infra.protocols import MessageQueue, ObjectStorage, ServiceRegistry
 from beacon_scale_infra.queue.memory import InMemoryMessageQueue
@@ -177,6 +184,28 @@ def _build_parser() -> argparse.ArgumentParser:
         help="No detenerse nunca al quedarse sin trabajo (servicio de larga duración)",
     )
     extract_worker_parser.add_argument(
+        "--local-storage-root", type=Path, default=Path(".local-object-storage")
+    )
+
+    build_index_parser = subparsers.add_parser(
+        "build-index",
+        help="Ejecuta el pipeline de indexación distribuida (map-reduce) sobre el corpus "
+        "particionado que dejó la fase 2, una única vez",
+    )
+    build_index_parser.add_argument("--storage-backend", choices=["local", "s3"], default="s3")
+    build_index_parser.add_argument("--bucket", default="beacon-scale-dev")
+    build_index_parser.add_argument("--extract-prefix", default="extracted-documents")
+    build_index_parser.add_argument("--index-output-prefix", default="search-index")
+    build_index_parser.add_argument(
+        "--corpus-object-key", default="search-index/corpus/documents.jsonl"
+    )
+    build_index_parser.add_argument(
+        "--no-compress",
+        action="store_true",
+        help="No invocar index-compression-codec tras fusionar el índice global",
+    )
+    build_index_parser.add_argument("--compressed-output-prefix", default="search-index-compressed")
+    build_index_parser.add_argument(
         "--local-storage-root", type=Path, default=Path(".local-object-storage")
     )
 
@@ -438,6 +467,38 @@ async def _run_extract_worker(args: argparse.Namespace) -> None:
         await queue.aclose()
 
 
+async def _run_build_index(args: argparse.Namespace) -> None:
+    config = IndexingPipelineConfig(
+        bucket=args.bucket,
+        extract_prefix=args.extract_prefix,
+        index_output_prefix=args.index_output_prefix,
+        corpus_object_key=args.corpus_object_key,
+        compress=not args.no_compress,
+        compressed_output_prefix=args.compressed_output_prefix,
+    )
+
+    storage: ObjectStorage
+    if args.storage_backend == "local":
+        storage = LocalFilesystemObjectStorage(args.local_storage_root)
+    else:
+        storage = S3ObjectStorage(
+            endpoint_url=_require_env("BEACON_S3_ENDPOINT_URL"),
+            access_key=_require_env("BEACON_S3_ACCESS_KEY"),
+            secret_key=_require_env("BEACON_S3_SECRET_KEY"),
+            region_name=os.environ.get("BEACON_S3_REGION", "us-east-1"),
+        )
+
+    pipeline = IndexingPipeline(config, storage=storage)
+    print(
+        f"[build-index] arrancando (bucket={args.bucket!r}, extract_prefix={args.extract_prefix!r})"
+    )
+    stats = await pipeline.run()
+    print(f"[build-index] terminado: {stats}")
+
+    if isinstance(storage, S3ObjectStorage):
+        await storage.aclose()
+
+
 async def _dispatch(args: argparse.Namespace) -> None:
     if args.command == "storage-demo":
         await _run_storage_demo(args)
@@ -449,6 +510,8 @@ async def _dispatch(args: argparse.Namespace) -> None:
         await _run_crawl_worker(args)
     elif args.command == "extract-worker":
         await _run_extract_worker(args)
+    elif args.command == "build-index":
+        await _run_build_index(args)
     else:  # pragma: no cover - argparse restringe 'command' a los subparsers de arriba
         raise AssertionError(f"comando desconocido: {args.command}")
 
