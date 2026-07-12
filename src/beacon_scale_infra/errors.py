@@ -38,3 +38,11 @@ class SharedDeduplicatorError(BeaconScaleInfraError):
 
 class CoordinatedRateLimiterError(BeaconScaleInfraError):
     """Fallo al adquirir o liberar un hueco del rate limiter coordinado."""
+
+
+class IndexingError(BeaconScaleInfraError):
+    """Fallo del pipeline de indexación distribuida (fase 3): una partición
+    ilegible, un rango de `doc_id` inconsistente con el manifiesto de fase 2,
+    o una colisión de `doc_id` entre particiones tras el remapeo -- nunca se
+    deja escapar la excepción cruda de `inverted-index-builder` ni de
+    `index-compression-codec` sin envolver (ver `ARCHITECTURE.md`, fase 3)."""
