@@ -23,19 +23,26 @@ Phase 3, built on top of phase 2's partitioned output, is a one-shot
 map-reduce job that assigns a global, deterministic `doc_id` to every
 document and merges the whole corpus into a single inverted index, in the
 same on-disk format a single-machine `inverted-index-builder` run would
-produce. See [`ARCHITECTURE.md`](ARCHITECTURE.md) for the full reasoning
-behind every decision across all four phases, the alternatives considered,
-and how each piece of phase 0 is meant to evolve toward Kubernetes.
+produce. Phase 4, built on top of phase 3's index and phase 1's raw pages,
+computes PageRank authority scores over the whole corpus as a one-shot job —
+and, after measuring the real memory/time cost of the reused algorithm at
+this project's target scale, runs it on a single process rather than
+building a distributed power-iteration engine the corpus does not need (see
+[`ARCHITECTURE.md`](ARCHITECTURE.md), "Phase 4 — PageRank", for the
+measurements). See [`ARCHITECTURE.md`](ARCHITECTURE.md) for the full
+reasoning behind every decision across all four phases, the alternatives
+considered, and how each piece of phase 0 is meant to evolve toward
+Kubernetes.
 
-This repo does not implement ranking or a query server, and it does not
-modify any of the ten existing `beacon-search-engine` repositories —
-`web-crawler-scheduler`'s own crawler logic (see "Distributed crawling
-(phase 1)" below), `html-content-extractor`'s own extraction logic (see
-"Distributed extraction (phase 2)" below), and `inverted-index-builder`'s /
-`index-compression-codec`'s own indexing and compression logic (see
-"Distributed indexing (phase 3)" below) are all reused as real package
-dependencies, unchanged. It is a sibling repository that later phases
-extend.
+This repo does not implement a query server, and it does not modify any of
+the ten existing `beacon-search-engine` repositories — `web-crawler-scheduler`'s
+own crawler logic (see "Distributed crawling (phase 1)" below),
+`html-content-extractor`'s own extraction logic (see "Distributed extraction
+(phase 2)" below), `inverted-index-builder`'s / `index-compression-codec`'s
+own indexing and compression logic (see "Distributed indexing (phase 3)"
+below), and `pagerank-link-analysis`'s own ranking algorithm (see "PageRank
+(phase 4)" below) are all reused as real package dependencies, unchanged. It
+is a sibling repository that later phases extend.
 
 ## Role in `beacon-search-engine`
 
@@ -107,6 +114,26 @@ beacon-search-engine-at-scale (this repo)
   │                                                             │
   │   indexing/compression logic reused unchanged from          │
   │   inverted-index-builder and index-compression-codec        │
+  └─────────────────────────────────────────────────────────┘
+        |
+        v
+  ┌─────────────────────────────────────────────────────────┐
+  │  phase 4 — PageRank (one batch job, single process)          │
+  │                                                             │
+  │   capacity check first: measured ~180 B/edge + ~1 KB/doc,  │
+  │   worst case at this project's scale <50 GB / <15 min --   │
+  │   no distributed power iteration built (see ARCHITECTURE)  │
+  │   link graph  <- phase-0 ObjectStorage, crawl-pages/,       │
+  │                  concurrent bounded fan-out (many small     │
+  │                  objects, unlike phase 3's few big parts)   │
+  │   doc_id space <- phase-3 search-index/documents.jsonl      │
+  │   output      -> phase-0 ObjectStorage: pagerank-scores/    │
+  │                  (doc_id -> pagerank_score, unmodified      │
+  │                  pagerank-link-analysis on-disk format)     │
+  │                                                             │
+  │   PageRank algorithm reused unchanged from                  │
+  │   pagerank-link-analysis: resolver, graph builder,          │
+  │   sparse power iteration, on-disk score format               │
   └─────────────────────────────────────────────────────────┘
         |
         v
@@ -334,6 +361,45 @@ uncompressed `search-index/` output directly. Without Docker, point
 `--storage-backend local --local-storage-root` at the same directory
 `extract-worker --storage-backend local` wrote to.
 
+## PageRank (phase 4)
+
+`src/beacon_scale_infra/pagerank/` computes link-authority scores over the
+whole corpus phase 3 indexed. Unlike phases 1–3, this phase's core algorithm
+is not per-document parallel work — it is a single sparse power iteration
+over the entire adjacency matrix at once — so before designing anything
+distributed, `ARCHITECTURE.md` measures the real memory/time cost of running
+`pagerank-link-analysis`'s own reused code unmodified at graduated scale, and
+extrapolates to this project's target (3–5M documents): worst case under
+50 GB peak RSS and under 15 minutes of single-core wall time, comfortably
+inside one large-memory cloud instance. See
+[`ARCHITECTURE.md`](ARCHITECTURE.md), section "Phase 4 — PageRank", for the
+full measurements and the extrapolation table. `compute-pagerank`, like
+`build-index`, is a one-shot batch job, not a service you scale with
+`--scale`.
+
+| Concern | Single process (`pagerank-link-analysis`) | This phase |
+|---|---|---|
+| `doc_id` resolution | `JsonlDocumentIdResolver` over a single-machine `documents.jsonl` | the same class, reused unchanged, pointed at phase 3's `search-index/documents.jsonl` (already satisfies its invariants — see `ARCHITECTURE.md`, phase 3, section 5) |
+| Link graph input | a single local `link_graph.jsonl` from `web-crawler-scheduler` | materialized from phase 1's `crawl-pages/` (one object per page) via bounded-concurrency fan-out (`link_graph_materializer.py`) — sequential reads would make network round-trips, not compute, this phase's real bottleneck |
+| Graph building, power iteration | `build_adjacency_matrix`, `compute_pagerank` | the same functions, reused unchanged, called on the materialized local files |
+| Output format | `write_pagerank_output` (`manifest.json`, `pagerank_scores.jsonl`, `convergence.json`) | the same function, called once, uploaded to phase-0 `ObjectStorage` |
+| Distribution across machines | N/A (one process) | none — section 1 of `ARCHITECTURE.md`'s phase-4 entry measures that this project's corpus fits comfortably on one large machine |
+
+### Running it
+
+```bash
+python -m beacon_scale_infra compute-pagerank \
+  --storage-backend s3 --bucket beacon-scale-dev
+```
+
+Requires the same `BEACON_S3_*` variables as `build-index`, and
+`build-index` (phase 3) to have already finished — `compute-pagerank` reads
+`search-index/documents.jsonl` directly. Tune `--max-concurrent-reads`
+(default `64`) to the object storage endpoint's real capacity when
+materializing the link graph from a large `crawl-pages/`. Without Docker,
+point `--storage-backend local --local-storage-root` at the same directory
+`build-index --storage-backend local` wrote to.
+
 ## Requirements and installation
 
 - Python `>=3.11`
@@ -418,6 +484,10 @@ object, message, or service instance, and prints every step.
   carries the full `ExtractedDocument` fields (including `main_text`) phase
   2 produced, one line per document, ordered so line position equals global
   `doc_id` — see "Distributed indexing (phase 3)" above.
+- **PageRank scores** (`pagerank-scores/` by default) are exactly
+  `pagerank-link-analysis`'s own on-disk format (`manifest.json`,
+  `pagerank_scores.jsonl` — `doc_id -> pagerank_score`, sorted ascending —
+  and `convergence.json`), unmodified — see "PageRank (phase 4)" above.
 
 ## Programmatic usage
 
@@ -526,6 +596,18 @@ predates a breaking constructor change in `aiohttp`'s `ClientResponse`).
   phase requires phase 2 to have fully stopped first (see `ARCHITECTURE.md`,
   phase 3, section 0); re-run `build-index` after confirming no
   `extract-worker` replica is still consuming the extraction frontier.
+- **`compute-pagerank` fails immediately with a `PageRankPhaseError` about
+  `search-index/documents.jsonl`:** `build-index` (phase 3) hasn't run yet,
+  or wrote to a different `--bucket`/`--index-output-prefix` than
+  `compute-pagerank`'s `--documents-object-key` points at — run `build-index`
+  first, or align the two commands' arguments.
+- **`compute-pagerank` reports a high `unresolved_target_links` /
+  `unresolved_source_entries` count:** expected for a real crawl — most of a
+  bounded-domain site's raw outbound links point outside the indexed corpus
+  (external sites, pages discarded during extraction). See `GraphBuildStats`
+  in `pagerank-link-analysis`'s own `models.py` for what each count means;
+  this is not an error, just visibility into how much of the raw link graph
+  fell outside the `doc_id` space (`ARCHITECTURE.md`, phase 4, section 4).
 
 ## License
 

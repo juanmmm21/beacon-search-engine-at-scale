@@ -813,3 +813,256 @@ hands the next phase (distributed query serving /
 index in object storage, plus a corpus file that keeps
 `beacon-search-console`'s snippet resolution working unmodified, to build
 on.
+
+## Phase 4 — PageRank
+
+This phase extends the phase-0 substrate with the fourth domain workload:
+computing link-authority scores over the whole corpus phase 3 indexed, in the
+exact on-disk format `pagerank-link-analysis` already defines and
+`learning-to-rank-reranker` already consumes (`doc_id -> pagerank_score`).
+
+Like phase 3, this is a one-shot batch job (`PageRankPipelineConfig` +
+`DistributedPageRankPipeline`, `pagerank/pipeline.py`), not a long-running
+worker consuming a queue: it needs phase 3's `search-index/documents.jsonl`
+to be finished (a stable, dense `doc_id` space to resolve URLs against), and
+`pagerank-link-analysis`'s own README already frames PageRank as "computed
+once per corpus (or recomputed whenever the link graph changes) rather than
+per search" — a batch recomputation, not a stream, is the correct shape for
+this phase independently of phase 3's own reasons for being one (see phase 3,
+section 0).
+
+### 0. Why this phase asks "does a single machine suffice?" before designing anything distributed
+
+Unlike phases 1–3, this phase's core algorithm (`pagerank_link_analysis.pagerank.compute_pagerank`)
+is not a per-document, embarrassingly parallel transform — it is a single
+sparse power iteration over the *entire* corpus's adjacency matrix at once,
+already vectorized with `scipy.sparse`/`numpy` (see that repo's own
+docstring: "cost per iteration proportional to the number of edges, never to
+the square of the number of pages"). Distributing a power iteration for real
+(partitioning the adjacency matrix across workers, exchanging the rank vector
+once per iteration over the phase-0 `MessageQueue`/`ObjectStorage`) is a
+substantial, genuinely new piece of infrastructure this repo does not
+currently have — and building it before checking whether it is actually
+needed at this project's stated target (`AGENTS.md`: "a few million pages,
+bounded domain") would be exactly the kind of complexity phase 0 already
+rejected once for orchestration ("Docker Compose for development, Kubernetes
+as the deliberate next step") and once for the message queue ("Redis Streams,
+not Kafka"): infrastructure ahead of a demonstrated need.
+
+### 1. Capacity analysis — measured, not assumed
+
+**Methodology.** `pagerank_link_analysis.document_resolver.JsonlDocumentIdResolver`,
+`graph_builder.build_adjacency_matrix` and `pagerank.compute_pagerank` were
+run **unmodified**, in a fresh process per data point (so one run's freed
+memory never masks another's peak), over synthetic `documents.jsonl` /
+`link_graph.jsonl` pairs generated at graduated `(total_documents,
+avg_out_degree)` sizes. Peak resident memory was read from
+`resource.getrusage(RUSAGE_SELF).ru_maxrss` — a high-water mark that never
+decreases within a process, so it captures the true peak even across memory
+that gets freed later in the same run (e.g. the edge set below, freed once
+the sparse matrix is built) — immediately after each stage. Four points,
+picked to separate the cost of `total_documents` (N) from the cost of
+`resolved_edges` (E):
+
+| Run | N (documents) | E (edges) | Resolver peak RSS | Peak RSS after graph build | Graph-build wall time |
+|---|---|---|---|---|---|
+| A | 200,000 | 2,000,000 | 191 MB | 533 MB | 8.3 s |
+| B | 200,000 | 8,000,000 | 191 MB | 1,538 MB | 31.4 s |
+| C | 800,000 | 8,000,000 | 622 MB | 1,955 MB | 36.1 s |
+| D | 1,000,000 | 20,000,000 | 782 MB | 3,445 MB | 88.0 s |
+
+Comparing B against C (same E, 4x N) isolates the resolver's own cost at
+~800–1,000 bytes/document (two `dict`s of `DocumentRecord`/`doc_id` keyed by
+`doc_id` and by normalized URL). Comparing A against B against D (varying E)
+isolates the graph-build cost at ~140–180 bytes/**edge** — call it 180 B/edge
+and 1,000 B/document for a conservative (upper-bound) capacity estimate.
+Wall time is consistently ~4–4.5 µs/edge for the graph-build stage; the
+power-iteration stage itself is negligible by comparison (0.04–0.44 s across
+all four runs, 7–11 iterations to converge on these synthetic graphs) because
+each iteration is one sparse matrix-vector product over the *final* CSR
+matrix, which is far smaller than the intermediate structure below.
+
+**Why per-edge cost is ~180 bytes, not the ~12–16 bytes a CSR matrix actually
+needs:** `build_adjacency_matrix` (`pagerank-link-analysis`, unmodified)
+deduplicates edges with a pure-Python `edges: set[tuple[int, int]]` before
+ever constructing a numpy array — see that file's own docstring for why
+(repeated nav-menu links must not double-count). Each element is a boxed
+`(int, int)` tuple in a hash set, which in CPython costs far more than two
+raw 4-byte integers: this is the dominant memory cost of this phase, not the
+final sparse matrix, and it is a property of the **unmodified upstream
+dependency**, not of any code this phase adds — reducing it would mean
+touching `pagerank-link-analysis` (numpy-vectorized dedup, e.g. structured
+arrays + `np.unique`), which stays out of scope for the same reason section
+"Why the ten original repos stay untouched" gives for every other repo. The
+capacity numbers below already account for this real cost, not a
+hypothetical optimized one.
+
+**Extrapolation to this project's target scale** (3–5 million documents, the
+range `AGENTS.md`/this document's introduction already commit to for the
+whole corpus), across a spread of plausible average out-degrees for a
+bounded-domain crawl with internal navigation links (15 on the low end, 40 on
+the high end for a nav-heavy site), with a 20% margin added on top of the raw
+`1,000·N + 180·E` bytes estimate for interpreter/OS overhead:
+
+| Documents | avg out-degree | Edges | Peak RSS (raw) | Peak RSS (+20% margin) | Graph-build wall time |
+|---|---|---|---|---|---|
+| 3,000,000 | 15 | 45,000,000 | 11.1 GB | 13.3 GB | ~3.4 min |
+| 3,000,000 | 25 | 75,000,000 | 16.5 GB | 19.8 GB | ~5.6 min |
+| 3,000,000 | 40 | 120,000,000 | 24.6 GB | 29.5 GB | ~9.0 min |
+| 5,000,000 | 15 | 75,000,000 | 18.5 GB | 22.2 GB | ~5.6 min |
+| 5,000,000 | 25 | 125,000,000 | 27.5 GB | 33.0 GB | ~9.4 min |
+| 5,000,000 | 40 | 200,000,000 | 41.0 GB | 49.2 GB | ~15.0 min |
+
+**Verdict: a single large-memory machine suffices; no distributed
+power-iteration engine is built in this phase.** Even the worst case in this
+project's stated scale (5M documents, avg out-degree 40) needs under 50 GB
+peak RSS and under 15 minutes of single-core wall time — comfortably inside
+one large-memory cloud instance (e.g. an AWS `r6i.4xlarge`, 128 GB RAM / 16
+vCPU, leaves 2.5x headroom over the worst case above; `r6i.8xlarge`, 256 GB,
+if a wider safety margin is wanted), run once per crawl (or whenever the link
+graph changes — never per query, per `pagerank-link-analysis`'s own framing).
+Building a partitioned, multi-worker power iteration exchanging the rank
+vector once per iteration over the phase-0 substrate would trade a
+few-minutes batch job for a genuinely harder distributed-systems problem
+(convergence checking across workers, partition-boundary edges, a
+synchronization barrier per iteration) to solve a capacity problem this
+corpus does not have. Revisit only if a real crawl's measured average
+out-degree or corpus size, after phase 1 actually runs, lands far outside the
+table above — the same "revisit only if profiling/real data shows otherwise"
+condition phase 0 (message queue) and phase 3 (sequential map step) already
+apply to their own scale decisions.
+
+### 2. Reuse decision — `pagerank-link-analysis`, unmodified, as a real package dependency
+
+`pagerank-link-analysis`'s `DocumentIdResolver` (`protocols.py`) is already a
+`Protocol`, decoupling `build_adjacency_matrix` from *how* a URL resolves to
+a `doc_id` — and its only real implementation, `JsonlDocumentIdResolver`,
+already resolves by the explicit `"doc_id"` JSON field on each
+`documents.jsonl` line, **not** by line position (`document_resolver.py`).
+Phase 3, section 5 of this document already established the consequence:
+phase 3's own merged `search-index/documents.jsonl` output satisfies both
+invariants that resolver needs (every `doc_id` unique, the ID space dense
+from `0`) by construction — so this phase needs **zero** new resolver code,
+only `search-index/documents.jsonl` downloaded to a local path and handed to
+`JsonlDocumentIdResolver` exactly as `pagerank-link-analysis`'s own
+`PageRankPipeline.from_documents_path` already does.
+
+This phase therefore reuses the entire `pagerank_link_analysis.pipeline.PageRankPipeline`
+unmodified — resolver, `graph_builder.build_adjacency_matrix`,
+`pagerank.compute_pagerank`, `PageRankParams` (damping factor, tolerance,
+max iterations) — as a real package dependency (pinned Git URL in
+`pyproject.toml`, same pattern as the other four repos this project already
+depends on). This phase's own orchestrator is named `DistributedPageRankPipeline`
+specifically so it never collides with `pagerank_link_analysis.pipeline.PageRankPipeline`
+(imported under the alias `CorpusPageRankPipeline` in `pagerank/pipeline.py`
+for extra clarity where both are in scope in the same file), never because
+any of its logic is touched. The on-disk
+output format (`scores_io.write_pagerank_output`: `manifest.json` +
+`pagerank_scores.jsonl` + `convergence.json`) is reused unmodified too — it
+is literally `pagerank-link-analysis`'s own declared integration contract
+with `learning-to-rank-reranker` (`doc_id -> pagerank_score`), not a format
+this phase has any reason to reinvent.
+
+### 3. The one genuinely new piece — materializing `link_graph.jsonl` from phase 1's raw pages, with concurrent fan-out
+
+`build_adjacency_matrix` takes a `Path` to a single local `link_graph.jsonl`
+file (its own docstring: entries in `{url, outlinks}` shape, one page per
+line) — an unmodified dependency's fixed input shape, the same
+materialize-then-call-unmodified-function pattern phase 3 already uses for
+`IndexBuilder.build` (`index/partition_indexer.py::materialize_partition_documents`).
+Unlike phase 3's map step, though, there is no phase-2-style manifest of a
+handful of large, pre-batched part-files to concatenate here: phase 1 writes
+**one object per crawled page** (`crawl-pages/date=<YYYY-MM-DD>/shard=<NNN>/<url_hash>.json`,
+`crawl/partitioning.py`) — for a few-million-page corpus, that is a few
+million individual objects. Reading them with a sequential `for` loop of
+`storage.get_object()` calls, the way phase 3's map step reads its handful of
+part-files, would make this phase's actual bottleneck **network round-trips**,
+not CPU: at even 10 ms/GET, 5,000,000 sequential calls is ~14 hours — far
+outside the batch-job time budget section 1 above establishes for the
+compute itself.
+
+**Decision:** `pagerank/link_graph_materializer.py::materialize_link_graph`
+lists `crawl-pages/` once via `ObjectStorage.list_objects` (already a
+streaming `AsyncIterator`, never buffers the bucket into memory — `protocols.py`)
+and fans the individual `get_object` calls out concurrently, bounded by an
+`asyncio.Semaphore(max_concurrent_reads)` (default `64`) — exactly the
+"`asyncio` for network I/O, never block the event loop" rule
+`~/Desarrollo/beacon-search-engine/CLAUDE.md` already mandates for this whole
+ecosystem, applied here to read fan-out instead of write fan-out. A page
+object that fails to parse (missing `final_url`/`outlinks` fields, invalid
+JSON — e.g. a page written by a future, incompatible `CrawledPageRecord`
+schema) is skipped and counted (`PageRankRunStats.pages_skipped_malformed`),
+never aborts the whole materialization — the same "never lose the batch over
+one bad record" principle phase 2 applies to a malformed page and phase 3
+applies to an unreadable partition.
+
+**The `url`/`final_url` convention already lines up with zero adaptation.**
+`pagerank-link-analysis`'s own `url_normalizer.py` docstring documents that
+`link_graph.jsonl`'s `url` field is expected to be the crawler's
+*post-redirect* URL, while `documents.jsonl`'s `url` field is expected to be
+*pre-redirect*. This phase's materializer writes `CrawledPageRecord.final_url`
+(post-redirect, phase 1's own field) as `link_graph.jsonl`'s `url`, and
+`CrawledPageRecord.outlinks` as `outlinks` — while phase 3's merged
+`search-index/documents.jsonl` carries `ExtractedDocument.url`, which
+`extract/page_extractor.py::extract_single_page` sets from
+`CrawledPageRecord.url` (pre-redirect). Both phase 1 and phase 2 already
+carried both fields through unchanged for their own reasons, before this
+phase existed — so satisfying `pagerank-link-analysis`'s existing,
+independently-implemented convention required no new field anywhere in this
+repo, only choosing which existing field maps to which side of the join.
+
+### 4. Output
+
+`pagerank-scores/` (default `output_prefix`) receives exactly
+`scores_io.write_pagerank_output`'s three files, uploaded to the phase-0
+`ObjectStorage` the same way phase 3 uploads `search-index/`
+(`_upload_directory`, `pagerank/pipeline.py`): `manifest.json` (format
+version + filenames), `pagerank_scores.jsonl` (`doc_id -> pagerank_score`,
+sorted ascending by `doc_id`), and `convergence.json` (damping factor,
+tolerance, iterations run, converged flag, and the graph-build stats —
+resolved edges, dangling documents, unresolved source/target counts — useful
+for auditing how much of a real crawl's raw link graph fell outside the
+indexed corpus).
+
+### Known limitations
+
+- **Materialization concurrency is bounded within one process, not
+  distributed across worker replicas.** `max_concurrent_reads` controls fan-out
+  against a single `ObjectStorage` endpoint from a single `DistributedPageRankPipeline`
+  run, not N worker processes each claiming a disjoint slice of `crawl-pages/`
+  — the same "not the bottleneck at this phase's target scale, revisit only
+  if profiling says otherwise" reasoning phase 3 already applies to its own
+  sequential map step (section 1's wall-time numbers above already include
+  this phase's actual materialization + compute cost, not a hypothetical
+  distributed one).
+- **`link_graph.jsonl` is materialized to a local file, not streamed directly
+  into `build_adjacency_matrix`,** because that function's own signature (an
+  unmodified dependency) takes a `Path`, not an iterator — unavoidable
+  without touching `pagerank-link-analysis`.
+- **No incremental recomputation.** Every run rebuilds the graph and reruns
+  power iteration from scratch over every page phase 1 ever wrote to
+  `crawl-pages/`; there is no notion of updating only the rank of documents
+  whose link neighborhood changed. Acceptable for the same reason phase 3
+  accepts it for indexing (a bounded-domain, occasionally-recomputed corpus,
+  not a continuously-updated one) — and section 1's wall-time numbers (single
+  minutes, even at this project's largest planned scale) mean a full
+  recompute has not been, and is not expected to become, an operational cost
+  worth engineering around.
+- The dominant memory cost identified in section 1 (the edge-dedup
+  `set[tuple[int, int]]`) is a property of the unmodified upstream
+  dependency's own implementation choice, not of any code this phase adds —
+  see section 1's own explanation of why reducing it is out of scope.
+
+### Non-goals of phase 4
+
+This phase does not: run BM25 scoring or reranking (`bm25-ranking-engine`/
+`learning-to-rank-reranker`, consuming this phase's `pagerank_scores.jsonl`
+through the contract `pagerank-link-analysis`'s own README already
+documents), distribute the power iteration itself across worker processes
+(ruled unnecessary by section 1's measured capacity numbers), modify
+`pagerank-link-analysis`'s algorithm or on-disk formats, or support
+incremental link-graph updates (see "Known limitations" above). It hands a
+future query-serving phase a `doc_id -> pagerank_score` mapping in object
+storage, ready to combine with a future BM25 signal exactly the way
+`learning-to-rank-reranker` already documents doing for the single-machine
+portfolio.
