@@ -14,6 +14,7 @@ dependencies = [
     "boto3>=1.34,<2",
     "redis>=5,<6",
     "aiohttp>=3.9,<4",
+    "web-crawler-scheduler @ git+https://github.com/juanmmm21/web-crawler-scheduler.git@main",
 ]
 
 [project.scripts]
@@ -33,6 +34,15 @@ dev = [
 [tool.hatch.build.targets.wheel]
 packages = ["src/beacon_scale_infra"]
 
+[tool.hatch.metadata]
+# web-crawler-scheduler no está publicado en PyPI: se consume como dependencia
+# de paquete real vía URL de Git directa (mismo patrón que
+# distributed-index-sharding con bm25-ranking-engine, ver ARCHITECTURE.md
+# sección "Por qué los diez repos originales no se tocan"). Hatchling rechaza
+# por defecto una dependencia PEP 508 por URL directa salvo que se habilite
+# explícitamente aquí.
+allow-direct-references = true
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
@@ -50,4 +60,12 @@ warn_unused_ignores = true
 
 [[tool.mypy.overrides]]
 module = "fakeredis.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+# web-crawler-scheduler no publica un marcador py.typed en su distribución
+# instalada (aunque su propio src/ pasa mypy --strict dentro de ese repo), así
+# que mypy lo trata como no tipado al consumirlo como dependencia desde aquí
+# -- mismo patrón ya aplicado a bm25-ranking-engine en distributed-index-sharding.
+module = "web_crawler_scheduler.*"
 ignore_missing_imports = true
