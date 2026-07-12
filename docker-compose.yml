@@ -1,14 +1,17 @@
 # Infraestructura de desarrollo local para beacon-search-engine-at-scale.
 #
 # Levanta los tres servicios de sustrato decididos en ARCHITECTURE.md
-# (almacenamiento de objetos, cola de mensajes, registro de servicio) más un
-# contenedor de arranque que crea el bucket de desarrollo -- nunca las 10
-# piezas de dominio de beacon-search-engine, que no viven aquí (ver
-# ARCHITECTURE.md, sección "Por qué los 10 repos originales no se tocan").
+# (almacenamiento de objetos, cola de mensajes, registro de servicio), un
+# contenedor de arranque que crea el bucket de desarrollo, y el servicio
+# 'crawl-worker' de la fase 1 (crawl distribuido) -- nunca las 10 piezas de
+# dominio de beacon-search-engine, que no viven aquí (ver ARCHITECTURE.md,
+# sección "Por qué los diez repos originales no se tocan").
 #
 # Uso:
 #   docker compose up -d
+#   docker compose up -d --scale crawl-worker=4   # N workers de crawl compartiendo frontera
 #   docker compose exec -it <servicio> ...   # inspección puntual
+#   docker compose logs -f crawl-worker            # ver qué worker crawlea qué URL
 #   docker compose down -v                     # borra también los volúmenes de datos
 
 services:
@@ -76,6 +79,40 @@ services:
       timeout: 5s
       retries: 10
     networks: [beacon-scale]
+
+  crawl-worker:
+    build: .
+    depends_on:
+      minio-init:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    environment:
+      BEACON_S3_ENDPOINT_URL: http://minio:9000
+      BEACON_S3_ACCESS_KEY: beacon-dev
+      BEACON_S3_SECRET_KEY: beacon-dev-secret
+      BEACON_REDIS_URL: redis://redis:6379/0
+      # URLs semilla separadas por comas, leídas por el worker si no se pasa
+      # '--seed' explícito (ver __main__.py, _resolve_seed_urls). Sin
+      # 'hostname:' explícito (Compose sin Swarm no soporta nombres de
+      # réplica plantilla), cada contenedor recibe un hostname corto de
+      # Docker distinto que el worker usa como --worker-id por defecto -- el
+      # campo 'fetched_by_worker' de cada página en MinIO refleja cuál de las
+      # N réplicas la crawleó (ver README, sección "Lanzar varios workers").
+      BEACON_CRAWL_SEED_URLS: ${BEACON_CRAWL_SEED_URLS:-https://example.com/}
+    command:
+      - crawl-worker
+      - --queue-backend
+      - redis
+      - --storage-backend
+      - s3
+      - --coordination-backend
+      - redis
+    networks: [beacon-scale]
+    # Un worker se detiene solo (código de salida 0) cuando la frontera se
+    # agota -- ver CrawlWorkerConfig.idle_polls_before_shutdown. Reiniciar
+    # solo ante un fallo real evita reiniciar en bucle un crawl ya terminado.
+    restart: on-failure
 
 networks:
   beacon-scale:
