@@ -29,6 +29,21 @@ un problema de red, esa URL jamás volvería a encolarse); aceptar algo de
 bloat en la cola compartida por descubrimientos duplicados de una misma URL
 es un coste barato comparado con perder páginas del corpus para siempre, y
 sigue garantizando que como mucho un worker llega a descargar cada URL.
+
+**Aviso a la fase 2 (extracción distribuida):** tras escribir cada página en
+el almacenamiento compartido, `_write_page` publica un mensaje ligero
+(`{"bucket": ..., "key": ...}`) en `config.extract_stream` -- la misma
+`MessageQueue` de fase 0, un stream distinto de la frontera de crawl. Es la
+única forma en que la fase 2 se entera de que hay una página nueva lista
+para extraer sin sondear el almacenamiento; el payload es deliberadamente un
+`dict` plano en vez de importar `beacon_scale_infra.extract.models.ExtractJob`
+aquí, para no acoplar este módulo de fase 1 a fase 2 -- el contrato entre
+ambas es el propio mensaje serializado, igual que el resto del ecosistema
+nunca comparte imports de modelos de dominio entre repos (ver
+`~/Desarrollo/beacon-search-engine/CLAUDE.md`). Si este `put_object` tiene
+éxito pero el `publish` que sigue falla, la página queda en el almacenamiento
+sin nunca extraerse -- un gap conocido, sin reconciliación automática en esta
+fase (ver `ARCHITECTURE.md`, fase 2, "Limitaciones conocidas").
 """
 
 from __future__ import annotations
@@ -239,4 +254,7 @@ class CrawlWorker:
         body = json.dumps(page.to_json_dict(), ensure_ascii=False).encode("utf-8")
         await self._storage.put_object(
             self._config.bucket, key, body, content_type="application/json"
+        )
+        await self._queue.publish(
+            self._config.extract_stream, {"bucket": self._config.bucket, "key": key}
         )

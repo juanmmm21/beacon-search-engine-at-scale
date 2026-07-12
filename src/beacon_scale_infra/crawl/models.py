@@ -103,6 +103,7 @@ class CrawlWorkerConfig:
     group: str = "beacon-scale-crawl-workers"
     bucket: str = "beacon-scale-dev"
     object_key_prefix: str = "crawl-pages"
+    extract_stream: str = "beacon-scale-extract-frontier"
     num_hash_shards: int = 16
     max_depth: int = 3
     max_pages: int | None = None
