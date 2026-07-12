@@ -250,3 +250,28 @@ async def test_two_workers_share_the_frontier_without_duplicate_downloads(tmp_pa
 
     stored = await _stored_pages(storage)
     assert {page["url"] for page in stored} == {_ROOT, _A, _B, _C}
+
+
+async def test_writing_a_page_publishes_an_extract_job_for_phase_two(tmp_path: Path) -> None:
+    """La fase 2 (extracción distribuida) no sondea el almacenamiento: se entera de cada
+    página nueva exclusivamente a través de este mensaje (ver `worker.py`, `_write_page`)."""
+    storage = LocalFilesystemObjectStorage(tmp_path)
+    queue = InMemoryMessageQueue()
+    worker, _ = _build_worker("w1", storage, queue=queue)
+
+    stats = await worker.run()
+
+    stored = await _stored_pages(storage)
+    assert len({page["url"] for page in stored}) == stats.pages_crawled
+
+    extract_stream = worker._config.extract_stream  # noqa: SLF001 - inspección en test
+    await queue.ensure_group(extract_stream, "test-inspection-group")
+    messages = await queue.consume(
+        extract_stream, "test-inspection-group", "test-consumer", count=100, block_ms=10
+    )
+    assert len(messages) == stats.pages_crawled
+    published_keys = {(message.payload["bucket"], message.payload["key"]) for message in messages}
+    stored_keys = {
+        (_BUCKET, entry.key) async for entry in storage.list_objects(_BUCKET, prefix=_PREFIX)
+    }
+    assert published_keys == stored_keys
