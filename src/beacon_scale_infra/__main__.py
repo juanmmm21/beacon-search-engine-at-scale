@@ -18,6 +18,11 @@ Fase 3 (`build-index`): ejecuta el pipeline de indexación distribuida una
 única vez (job por lotes, no un servicio escalable a réplicas como los dos
 comandos anteriores -- ver `ARCHITECTURE.md`, fase 3, sección 0), después de
 que la fase 2 haya terminado de escribir todas sus particiones.
+
+Fase 4 (`compute-pagerank`): ejecuta el pipeline de PageRank distribuido una
+única vez (job por lotes, mismo criterio que `build-index` -- ver
+`ARCHITECTURE.md`, fase 4, sección 0), después de que `build-index` haya
+dejado `search-index/documents.jsonl` listo.
 """
 
 from __future__ import annotations
@@ -33,6 +38,7 @@ from pathlib import Path
 import aiohttp
 import redis.asyncio as redis_asyncio
 from html_content_extractor.models import ExtractionConfig
+from pagerank_link_analysis.models import PageRankParams
 from web_crawler_scheduler.fetcher import AiohttpFetcher
 from web_crawler_scheduler.robots import RobotsCache
 
@@ -50,6 +56,8 @@ from beacon_scale_infra.extract.worker import ExtractWorker
 from beacon_scale_infra.index.models import IndexingPipelineConfig
 from beacon_scale_infra.index.pipeline import IndexingPipeline
 from beacon_scale_infra.models import ServiceInstance
+from beacon_scale_infra.pagerank.models import PageRankPipelineConfig
+from beacon_scale_infra.pagerank.pipeline import DistributedPageRankPipeline
 from beacon_scale_infra.protocols import MessageQueue, ObjectStorage, ServiceRegistry
 from beacon_scale_infra.queue.memory import InMemoryMessageQueue
 from beacon_scale_infra.queue.redis_streams import RedisStreamsMessageQueue
@@ -206,6 +214,32 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     build_index_parser.add_argument("--compressed-output-prefix", default="search-index-compressed")
     build_index_parser.add_argument(
+        "--local-storage-root", type=Path, default=Path(".local-object-storage")
+    )
+
+    compute_pagerank_parser = subparsers.add_parser(
+        "compute-pagerank",
+        help="Ejecuta el pipeline de PageRank distribuido sobre el corpus indexado por la "
+        "fase 3 y el grafo de enlaces crudo de la fase 1, una única vez",
+    )
+    compute_pagerank_parser.add_argument("--storage-backend", choices=["local", "s3"], default="s3")
+    compute_pagerank_parser.add_argument("--bucket", default="beacon-scale-dev")
+    compute_pagerank_parser.add_argument("--crawl-pages-prefix", default="crawl-pages")
+    compute_pagerank_parser.add_argument(
+        "--documents-object-key", default="search-index/documents.jsonl"
+    )
+    compute_pagerank_parser.add_argument("--output-prefix", default="pagerank-scores")
+    compute_pagerank_parser.add_argument(
+        "--max-concurrent-reads",
+        type=int,
+        default=64,
+        help="Lecturas concurrentes acotadas al materializar link_graph.jsonl desde "
+        "crawl-pages/ (ver ARCHITECTURE.md, fase 4, sección 3)",
+    )
+    compute_pagerank_parser.add_argument("--damping-factor", type=float, default=0.85)
+    compute_pagerank_parser.add_argument("--tolerance", type=float, default=1.0e-6)
+    compute_pagerank_parser.add_argument("--max-iterations", type=int, default=100)
+    compute_pagerank_parser.add_argument(
         "--local-storage-root", type=Path, default=Path(".local-object-storage")
     )
 
@@ -499,6 +533,43 @@ async def _run_build_index(args: argparse.Namespace) -> None:
         await storage.aclose()
 
 
+async def _run_compute_pagerank(args: argparse.Namespace) -> None:
+    config = PageRankPipelineConfig(
+        bucket=args.bucket,
+        crawl_pages_prefix=args.crawl_pages_prefix,
+        documents_object_key=args.documents_object_key,
+        output_prefix=args.output_prefix,
+        max_concurrent_reads=args.max_concurrent_reads,
+        pagerank_params=PageRankParams(
+            damping_factor=args.damping_factor,
+            tolerance=args.tolerance,
+            max_iterations=args.max_iterations,
+        ),
+    )
+
+    storage: ObjectStorage
+    if args.storage_backend == "local":
+        storage = LocalFilesystemObjectStorage(args.local_storage_root)
+    else:
+        storage = S3ObjectStorage(
+            endpoint_url=_require_env("BEACON_S3_ENDPOINT_URL"),
+            access_key=_require_env("BEACON_S3_ACCESS_KEY"),
+            secret_key=_require_env("BEACON_S3_SECRET_KEY"),
+            region_name=os.environ.get("BEACON_S3_REGION", "us-east-1"),
+        )
+
+    pipeline = DistributedPageRankPipeline(config, storage=storage)
+    print(
+        f"[compute-pagerank] arrancando (bucket={args.bucket!r}, "
+        f"crawl_pages_prefix={args.crawl_pages_prefix!r})"
+    )
+    stats = await pipeline.run()
+    print(f"[compute-pagerank] terminado: {stats}")
+
+    if isinstance(storage, S3ObjectStorage):
+        await storage.aclose()
+
+
 async def _dispatch(args: argparse.Namespace) -> None:
     if args.command == "storage-demo":
         await _run_storage_demo(args)
@@ -512,6 +583,8 @@ async def _dispatch(args: argparse.Namespace) -> None:
         await _run_extract_worker(args)
     elif args.command == "build-index":
         await _run_build_index(args)
+    elif args.command == "compute-pagerank":
+        await _run_compute_pagerank(args)
     else:  # pragma: no cover - argparse restringe 'command' a los subparsers de arriba
         raise AssertionError(f"comando desconocido: {args.command}")
 
