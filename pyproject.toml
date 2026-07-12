@@ -18,6 +18,7 @@ dependencies = [
     "html-content-extractor @ git+https://github.com/juanmmm21/html-content-extractor.git@main",
     "inverted-index-builder @ git+https://github.com/juanmmm21/inverted-index-builder.git@main",
     "index-compression-codec @ git+https://github.com/juanmmm21/index-compression-codec.git@main",
+    "pagerank-link-analysis @ git+https://github.com/juanmmm21/pagerank-link-analysis.git@main",
 ]
 
 [project.scripts]
@@ -92,4 +93,11 @@ ignore_missing_imports = true
 # index-compression-codec tampoco publica un marcador py.typed en su
 # distribución instalada, pese a pasar mypy --strict dentro de su propio repo.
 module = "index_compression_codec.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+# Mismo caso que el resto de dependencias del ecosistema arriba:
+# pagerank-link-analysis tampoco publica un marcador py.typed en su
+# distribución instalada, pese a pasar mypy --strict dentro de su propio repo.
+module = "pagerank_link_analysis.*"
 ignore_missing_imports = true
