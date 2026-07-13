@@ -19,6 +19,7 @@ dependencies = [
     "inverted-index-builder @ git+https://github.com/juanmmm21/inverted-index-builder.git@main",
     "index-compression-codec @ git+https://github.com/juanmmm21/index-compression-codec.git@main",
     "pagerank-link-analysis @ git+https://github.com/juanmmm21/pagerank-link-analysis.git@main",
+    "distributed-index-sharding @ git+https://github.com/juanmmm21/distributed-index-sharding.git@main",
 ]
 
 [project.scripts]
@@ -100,4 +101,11 @@ ignore_missing_imports = true
 # pagerank-link-analysis tampoco publica un marcador py.typed en su
 # distribución instalada, pese a pasar mypy --strict dentro de su propio repo.
 module = "pagerank_link_analysis.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+# Mismo caso que el resto de dependencias del ecosistema arriba:
+# distributed-index-sharding tampoco publica un marcador py.typed en su
+# distribución instalada, pese a pasar mypy --strict dentro de su propio repo.
+module = "distributed_index_sharding.*"
 ignore_missing_imports = true
