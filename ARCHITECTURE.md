@@ -1471,3 +1471,352 @@ boot):
   own `Job` completes — the identical one-shot-batch-vs-long-running-service
   distinction this phase already draws for Compose (section 3 above),
   carried over unchanged.
+
+## Phase 6 — The console over the real cluster
+
+This phase puts the flagship application — `beacon-search-console`, the last
+of the ten original repositories — in front of the phase-5 shard cluster: a
+FastAPI service exposing the exact same versioned `/api/v1/...` contract that
+app already defines, runnable as N interchangeable replicas behind a load
+balancer, with a shared Redis result cache that is never allowed to serve
+stale results silently.
+
+`beacon-search-console` stays untouched (see "Why the ten original repos stay
+untouched" above) and is reused as a **real package dependency** (pinned Git
+URL, `#subdirectory=backend`): its API response models (`models.py` — reusing
+them *is* what guarantees the contract stays identical, field by field), its
+snippet construction (`build_snippet` — window + highlight ranges), and its
+`stats.json` reader are imported unmodified, and its React frontend runs
+against this API without any change. What this phase replaces is exactly the
+app's *orchestration layer* (`dependencies.py`/`AppState`), which is built
+for a single process on a single machine and breaks with more than one API
+replica in two concrete ways:
+
+1. **`AppState.build` starts real shard subprocesses** via
+   `DistributedSearchPipeline.start` (`LocalShardCluster`), bound to
+   `shard_host:shard_base_port..+N` on the local machine. A second replica on
+   the same host collides on those ports; on a different host it spawns a
+   redundant private copy of every shard instead of talking to the real
+   phase-5 cluster.
+2. **Everything else is loaded once into process memory** (snippet table,
+   autocomplete tries, spellcheck vocabulary, reranker model and per-shard
+   index readers) — independent copies per replica, with no shared cache or
+   invalidation between them.
+
+This phase resolves each of those pieces explicitly — either onto the shared
+phase-0 substrate, or as state that is *safe to rebuild identically per
+replica* — and documents the decision per piece (section 4).
+
+### 0. The serving path, end to end
+
+`ConsoleAppState` (`console/dependencies.py`) is the phase-6 analogue of the
+console's `AppState`: built once per replica in the FastAPI lifespan, closed
+explicitly on shutdown. A search request flows exactly like the original
+console's (parse + spellcheck → fan-out → rerank → snippets), with the
+fan-out now going through `ClusterSearchClient` (`console/cluster_search.py`)
+— the same composition as phase 5's `DistributedQueryServingPipeline`
+(fresh `ServiceRegistry` discovery before every query, one cheap
+`SearchCoordinator` per query over a shared `aiohttp` session), reimplemented
+at the console layer because the console needs one thing that class does not
+expose: *which index version the chosen replica of each shard announces*
+(section 2).
+
+### 1. Replacing `DistributedSearchPipeline` — discovery, not subprocesses
+
+The API process never starts, owns, or health-checks a shard. Shard replicas
+are phase 5's `shard-replica` containers, discovered per query through the
+phase-0 `ServiceRegistry` with the same one-target-per-`shard_id`
+deterministic choice `resolve_shard_targets` already implements (refactored
+into `choose_shard_instances` so the console can read the chosen instances'
+metadata; the phase-5 function delegates to it unchanged). Killing an API
+replica affects no shard; killing a shard replica degrades queries exactly as
+phase 5 already guarantees. `distributed-index-sharding`'s coordinator,
+transport and merge run unmodified, as everywhere else in this repo.
+
+### 2. The index version — a content hash announced by the shards themselves
+
+**The question this phase was required to answer explicitly: what event
+invalidates the result cache?** The answer: **a change in the index version
+that the live shard replicas announce**, verified per query.
+
+**What the version is.** `build-index` (phase 3) now computes
+`index_version = sha256` over the artifacts a query ultimately serves from —
+the four merged index files plus the doc_id-aligned corpus file — and
+publishes it as an `index_version.json` marker next to both index prefixes
+(`search-index/`, `search-index-compressed/`). It is a *content* version, not
+a timestamp or build counter: re-running `build-index` over the same phase-2
+corpus produces byte-identical artifacts (phase 3's determinism, section 4)
+and therefore the same version — correct, because cached results for that
+index remain valid. Only a genuinely different corpus produces a different
+version.
+
+**How it reaches the serving path.** `shard-index` (phase 5) refuses to run
+without the marker (the remedy is printed: re-run `build-index`), and
+republishes it at `shard-index/index_version.json`; every `shard-replica`
+reads it at startup and includes it in its `ServiceRegistry` registration
+metadata (`{"shard_id": ..., "index_version": ...}`). The console therefore
+learns, on every query and with zero extra round trips (the metadata rides on
+the discovery response it already makes), which build **the live shards are
+actually serving right now** — not which build happened to be in the bucket
+when something started.
+
+**Why not the alternatives:**
+
+- *A timestamp or monotonic build counter* would invalidate the cache after a
+  rebuild that changed nothing, and would need a coordination point to assign
+  (exactly what phase 3 rejected for doc_ids: a central counter in a batch
+  pipeline that is otherwise a pure function of its input).
+- *Verifying against the bucket's marker at startup only* proves nothing
+  about live shards: a shard replica started before the last `build-index`
+  keeps serving its old partition regardless of what the bucket says now.
+  (The startup check still exists — as an early operator warning, see
+  `console/artifacts.py` — but the binding check is per query.)
+- *A version endpoint on the shard HTTP server* would require modifying
+  `distributed-index-sharding` — ruled out for every phase by "Why the ten
+  original repos stay untouched"; the registry metadata channel already
+  exists (phase 5 established it for `shard_id`) and costs nothing per query.
+
+**Per-query coherence rules** (`ClusterSearchClient.snapshot`): a chosen
+replica announcing the *same* version as the API loaded participates
+normally and the query is cacheable. One announcing a *different* version is
+**excluded from the fan-out** and reported as an explicit `error` in
+`shard_statuses` — merging its doc_ids against another build's corpus would
+render snippets of the wrong documents, which is precisely the silent
+staleness this phase exists to prevent; explicit partial degradation is the
+ecosystem's standard failure shape (phase 5, section 0). One announcing *no*
+version (a `shard-index/` output predating the marker) participates — the
+same unverified behavior the original console always had — but the query is
+not cacheable, because without a verified version there is no safe cache
+namespace.
+
+### 3. The shared result cache — Redis, namespaced by index version
+
+`CacheStore` joins the phase-0 substrate (`protocols.py`) with the standard
+protocol-plus-two-implementations shape: `InMemoryCacheStore` (deterministic,
+injectable clock, LRU-bounded — never unbounded growth) and `RedisCacheStore`
+(`SET ... PX`/`GET`, every SDK error wrapped as `CacheError`).
+
+**Connection/namespace decision, as required:** the cache reuses the **same
+Redis instance** phase 0 already runs (the one hosting the message queue and
+phase 1's crawl coordination) under a **dedicated key namespace**
+(`beacon:console:cache:v1:...`) — the same call phase 1 already made when it
+put the dedup set and rate-limiter keys on the existing instance rather than
+operating a second Redis service. The **connection** is the API process's
+own (`RedisCacheStore.from_url`): the console consumes no `MessageQueue`, so
+there is no existing connection in that process to share — "reuse the
+instance, own your connection".
+
+**Invalidation without deletion.** The cache key embeds the verified index
+version: `beacon:console:cache:v1:<index_version>:q=<sha256(query)>:limit=N`.
+When the index is rebuilt and the shard replicas restart with the new build,
+their announced version changes, so the key namespace changes at that exact
+moment — no query ever reads an entry produced by the previous build, with no
+`SCAN`+`DEL` sweep, no purge race between replicas, and no reliance on
+operators remembering to flush anything. Orphaned entries of retired versions
+expire on their own TTL (the TTL's only job — freshness within one version is
+already guaranteed, because a version's results are immutable by
+construction).
+
+**What is never cached:** degraded responses (missing/failed/excluded shards
+— transient states must not outlive their cause) and unverified-cluster
+responses (section 2). **What a cache failure does:** Redis down or an entry
+unreadable degrades to computing the query normally, logged — a cache can
+make search cheaper, never make it fail (`CacheError` is caught at the
+console layer, not propagated).
+
+### 4. Per-piece decision: shared state vs. state rebuilt per replica
+
+| `beacon-search-console` `AppState` piece | Phase-6 decision | Why |
+|---|---|---|
+| `pipeline` (shard subprocesses) | **shared infrastructure** — the phase-5 cluster, discovered via phase-0 `ServiceRegistry` | section 1: the one piece that *cannot* be per-replica |
+| search results (uncached in the original) | **shared state** — Redis `CacheStore`, version-namespaced | sections 2–3: the one piece that must be shared *and* invalidated |
+| `snippet_index` (whole corpus in RAM) | **neither** — resolved on demand from phase-2 partitions in `ObjectStorage`, bounded LRU of hot part files | section 5: gigabytes per replica at target scale; the data already lives in shared storage |
+| `spell_checker`, `autocomplete_index` | **rebuilt per replica** at startup from the downloaded phase-3 index | pure deterministic functions of an immutable build artifact — N replicas build bit-identical structures, so sharing buys nothing; serializing the tries to storage would mean pickling another repo's internals across process boundaries, which the ecosystem forbids, and `query-parser-autocomplete` exposes no serialization of its own |
+| `reranker_model`, `rerank_context` | **rebuilt per replica** (model downloaded from `ObjectStorage`, readers loaded once) | same determinism argument; see section 6 for the memory boundary this implies |
+| `global_stats`, `last_crawled_at` | **rebuilt per replica** (tiny) | `stats.json` is a few hundred bytes; `last_crawled_at` is computed once by `build-index` and carried in the corpus catalog — never rescanned at API startup |
+
+Anything rebuilt per replica is keyed to one `index_version` for the
+replica's lifetime; the per-query check (section 2) is what makes a fleet of
+replicas on mixed versions fail explicitly instead of subtly.
+
+### 5. Snippets — `doc_id → (partition, part file, line)` against phase-2 partitions
+
+The console's positional contract (`doc_id` = line number in one
+`documents.jsonl` loaded whole into RAM) is replaced by an on-demand
+resolution against the real phase-2 partitions, using the same construction
+phase 3 already used for partitions, pushed one level deeper: `build-index`
+now also publishes a **corpus catalog** (`search-index/corpus_catalog.json`)
+assigning every *part file* its contiguous global doc_id range
+`[start, start + non-blank-line-count)` — computed in the same
+materialization pass phase 3 already makes, counting lines by exactly
+`IndexBuilder.build`'s rule (blank lines don't consume a doc_id), plus the
+corpus-wide `last_crawled_at` (max `fetched_at`, computed here so no replica
+ever rescans the corpus). Resolution at query time is a binary search over
+part boundaries (`bisect`, the same shape as `DocIdRangeAssignment.
+partition_for`), one `get_object` for the single part file (~
+`flush_every_pages` documents) on a miss, and a bounded in-process LRU for
+hot parts. A doc_id out of range, a vanished part, or an unreadable part
+resolves to `None` — that result is dropped and the rest served, the same
+degradation the console applies to an inconsistent bootstrap.
+
+**Why not the two simpler options:** loading phase 3's corpus file into every
+replica's memory is the original console's design and is exactly what breaks
+at target scale (gigabytes of `main_text` duplicated per replica); keeping it
+on local disk with a byte-offset index would still download the full
+multi-GB corpus on every replica start. The catalog costs one small JSON
+object and reuses downloads the part-file granularity already gives for free.
+(The corpus file itself is still written — phase 3, section 5's guarantee to
+the *original* console deployment is not revoked by this phase.)
+
+The pipeline also gained an integrity check for free: the per-part counts are
+compared against the phase-2 manifest during `build-index`, so a manifest
+that drifted from the real partitions (an `extract-worker` still writing)
+now fails explicitly instead of producing a silently misaligned doc_id space
+(the risk phase 3 section 0 describes, now enforced, not just documented).
+
+### 6. Reranking — preloaded global readers, and the honest capacity boundary
+
+`learning_to_rank_reranker.pipeline.rerank` constructs an
+`InvertedIndexReader` (which loads `documents.jsonl` + `postings.jsonl`
+fully into memory — that reader has no lazy mode) and re-reads the PageRank
+scores *on every call*. The original console pays that cost per query per
+shard; at this repo's scale that is a multi-gigabyte parse per search.
+`PreloadedRerankContext` (`console/reranking.py`) composes the same public
+pieces of that unmodified package — `InvertedIndexReader`,
+`read_pagerank_scores`, `extract_features`, `LightGBMReranker.predict`, and
+the ecosystem's standard deterministic tie-break — with the readers built
+once at replica startup. It also dissolves the console's sharding↔reranking
+bridge: candidates are reranked against the *global* phase-3 index (the
+doc_ids shards return are global, and the global index contains every
+candidate's features), so no grouping by owning shard is needed — that
+grouping only ever existed because `rerank()` opens one directory per call
+and the original console's `data/` layout made per-shard directories the
+cheap option.
+
+**The boundary, stated rather than hidden:** this keeps the full uncompressed
+index (documents + postings) in each API replica's memory. At the lower end
+of this project's target (∼1M documents) that is single-digit gigabytes and
+acceptable for a handful of API replicas; toward the 5M upper end it becomes
+the dominant per-replica cost. The correct evolution is moving feature
+extraction into the shard servers themselves (each already holds its
+shard-local index in memory — features could ride back on the existing
+search response), but that means extending `distributed-index-sharding`'s
+server and response contract, which "Why the ten original repos stay
+untouched" rules out for this repo. Documented as the known limitation below
+rather than half-solved here.
+
+**The model artifact** has no producer among phases 0–5, so this phase adds
+the missing batch job: `train-reranker` runs
+`learning_to_rank_reranker.pipeline.train` unmodified (the same
+deterministic synthetic-dataset training, same defaults, that the console's
+own bootstrap runs) and uploads the saved model directory to `ObjectStorage`
+(`ltr-model/`), from which every replica downloads it at startup. The model
+is index-independent (synthetic features), so it carries no index version.
+
+### 7. N API replicas behind a load balancer
+
+`docker-compose.yml` adds `console-api` (this repo's image running
+`serve-console`; no host ports published — two replicas cannot share one) and
+`console-lb`, an nginx that resolves `console-api` against Docker's embedded
+DNS with a short re-resolution TTL, so `docker compose up -d --scale
+console-api=N` adds replicas to the round-robin without touching any
+configuration and a restarted replica's new IP is picked up without
+restarting the balancer. Replicas are interchangeable by construction
+(sections 1–6): any replica answers any request, a cache entry written
+through one is read through another, and killing one loses nothing but its
+in-flight requests. The Kubernetes translation is the same one phase 5
+already documents — a `Deployment` with `spec.replicas=N` behind a `Service`,
+with the artifact download in an init container.
+
+### 8. Serving the frontend from a CDN (documented, not implemented)
+
+What the split looks like, given what the frontend actually is (a static
+Vite/React build from `beacon-search-console`, unmodified):
+
+- **Static, CDN-servable:** the build output (`index.html` plus
+  content-hashed JS/CSS bundles). It contains no corpus data — results,
+  snippets and stats all arrive over `/api/v1` at runtime — so a new index
+  build does **not** change these assets and does **not** require a CDN
+  purge. Vite's content-hashed filenames get immutable, long-TTL cache
+  headers; `index.html` (the only non-hashed asset, it names the current
+  bundles) gets a short TTL or `no-cache` with revalidation, which is the
+  entire deployment story for a frontend-only release too.
+- **Dynamic, never CDN-cached by default:** everything under `/api/v1/...`,
+  which must keep hitting the load balancer. The CDN routes `/api/*` to the
+  origin (LB) and everything else to the static bucket — the same-origin
+  layout also removes the need for the wide-open CORS the development setup
+  uses.
+- **If API responses were later CDN-cached** (they are cacheable in
+  principle: GET, no cookies, no per-user variation): the invalidation event
+  is the same one section 2 defines — the index version — so the API would
+  emit it (e.g. a `Cache-Control: s-maxage` bounded low, or a surrogate
+  key equal to `index_version` purged when shards announce a new one). Not
+  implemented because the Redis layer already de-duplicates repeated queries
+  for every replica, and an edge cache only earns its invalidation
+  complexity with geographically distributed read traffic this project does
+  not have.
+
+### Testing this phase
+
+- **Cache backends** (`tests/test_cache_memory.py`, `tests/test_cache_redis.py`):
+  the local implementation directly (injected clock for TTL, LRU bound and
+  eviction order); the Redis implementation against `fakeredis` (native `PX`
+  expiry actually applied, every failure wrapped as `CacheError`, including
+  the disconnected-client path).
+- **Corpus catalog and index version** (`tests/test_index_corpus_catalog.py`,
+  `tests/test_index_version.py`): per-part ranges and blank-line/no-trailing-
+  newline handling against the local storage backend, binary-search
+  resolution, JSON round-trips, determinism of the content hash (same corpus
+  → same version, different corpus → different version), both markers
+  published, and the manifest-drift check failing explicitly.
+- **Snippet resolution** (`tests/test_console_snippets.py`): across part and
+  partition boundaries, hot parts downloaded exactly once (verified by
+  counting real reads on a counting subclass of the local backend, not a
+  mock), LRU eviction, and every degradation path resolving to `None`.
+- **The API end to end** (`tests/test_console_app.py`): real artifacts built
+  by the real phase-3/5/6 batch pipelines, real
+  `distributed-index-sharding` shard servers over real sockets, the FastAPI
+  app driven over ASGI — merged, reranked, snippeted results; a cache hit
+  serving identical results after the entire cluster dies; degraded and
+  unverified responses never cached; a stale-version replica excluded and
+  reported; a replica-less partition reported; autocomplete and stats.
+- **The reranker job** (`tests/test_console_reranker_job.py`): the published
+  model round-trips through object storage back into `LightGBMReranker.load`.
+
+### Known limitations
+
+- **Picking up a new index build requires restarting the serving fleet**
+  (shard replicas, then API replicas): every replica binds its artifacts to
+  one `index_version` for its lifetime, and there is no live reload. The
+  version check makes the transition explicit — shards already on the new
+  build are excluded (with a named reason) by API replicas still on the old
+  one, never merged incoherently — but a deployment that forgets to restart
+  the APIs serves degraded responses until it does. Live artifact reload is
+  deliberate future work, not an oversight: it would add a second lifecycle
+  to every piece section 4 currently keeps immutable per process.
+- **A shard replica without an announced version disables caching but not
+  serving** (section 2): coherence against such a replica is unverifiable by
+  construction. The gap closes itself as soon as `shard-index` has run once
+  with the marker (all new replicas announce it).
+- **Per-replica startup cost**: each API replica downloads the full
+  uncompressed index (for the reranker's reader and the query-parser
+  vocabulary) — minutes, not seconds, against a multi-GB index. Acceptable
+  for a fleet of a few replicas; an artifact volume shared between replicas
+  on one node, or the shard-side feature extraction of section 6, are the
+  known escape hatches.
+- **The reranker's in-memory global index** is the dominant per-replica
+  memory cost at the top of the target scale — see section 6 for why the
+  real fix lives outside this repo's constraints.
+- The LTR model is trained on `learning-to-rank-reranker`'s synthetic
+  dataset — inherited from the reference app, unchanged; a real click log
+  would be a different project.
+
+### Non-goals of phase 6
+
+This phase does not: modify `beacon-search-console` (its backend package and
+frontend are consumed as-is), reimplement parsing/BM25/merging/reranking
+feature extraction (all reused unmodified), implement live index reload or
+blue/green index swaps (see "Known limitations"), stand up a CDN (section 8
+documents the split), add authentication/rate limiting to the API, or feed
+autocomplete with a real query log (the synthetic default of
+`query-parser-autocomplete` is used, exactly like the reference app).
