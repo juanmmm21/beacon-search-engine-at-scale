@@ -1066,3 +1066,408 @@ future query-serving phase a `doc_id -> pagerank_score` mapping in object
 storage, ready to combine with a future BM25 signal exactly the way
 `learning-to-rank-reranker` already documents doing for the single-machine
 portfolio.
+
+## Phase 5 — Distributed query serving
+
+This phase extends the phase-0 substrate with the last domain workload before
+the flagship app: answering a search query by fanning it out to every shard of
+the index phase 3 built and merging the already-ranked results, over real,
+independently restartable infrastructure (containers today, pods later)
+instead of local subprocesses.
+
+`distributed-index-sharding` (one of the ten original `beacon-search-engine`
+repositories) already implements every piece of this — document-based
+partitioning (`partition_index`), the shard HTTP server
+(`shard_server.run_shard_server`), the async fan-out with per-shard timeout
+(`SearchCoordinator`), and the k-way merge of already-ranked partial results
+(`merge_shard_outcomes`) — for shards it discovers as a fixed, hand-typed list
+of `ShardTarget(shard_id, host, port)`, running as local OS subprocesses that
+`distributed_index_sharding.cluster.LocalShardCluster` launches and tracks
+itself. That repository stays untouched (see "Why the ten original repos stay
+untouched" above): this phase reuses `partition_index`,
+`SearchCoordinator`, `HttpShardTransport`, `run_shard_server` (via its own
+`serve-shard` CLI subcommand, launched as a real subprocess exactly like
+`LocalShardCluster` already does) and `query_translation` unmodified, as a
+real package dependency (pinned Git URL in `pyproject.toml`, same pattern as
+phases 1–4), and adds only what running shards as real, independently
+restartable, horizontally-scaled infrastructure requires and
+`distributed-index-sharding` explicitly does not attempt itself: turning a
+fixed list of shard addresses into one that is discovered, kept fresh, and
+survives individual replicas dying — see its own README, section "Adding or
+removing a shard without downtime", which frames exactly this as the
+caller's job, not `LocalShardCluster`'s.
+
+### 0. The nuance this phase has to resolve that `distributed-index-sharding` does not: replicas of the same shard
+
+`SearchCoordinator.search` (`coordinator.py`) fans a query out to *every*
+`ShardTarget` in the list it is given, concurrently, with no notion of two
+targets being "the same shard": it does not deduplicate by `shard_id`. This is
+correct and sufficient for `distributed-index-sharding`'s own scope — one
+process per shard, one target per shard, resized by hand — but it means this
+phase cannot simply hand `SearchCoordinator` every live replica discovered for
+a service name. If shard 0 has two live replicas and both end up in the
+`ShardTarget` list, `SearchCoordinator` asks both, and
+`merge_shard_outcomes` — which has no idea two `ShardOutcome`s came from
+replicas of the same partition, only that they carry the same `shard_id` in
+different list entries — folds both into the merged result, double-counting
+every document shard 0 holds.
+
+**Decision:** `resolve_shard_targets` (`query/shard_discovery.py`) is the seam
+where this gets resolved, entirely on this phase's side, before anything ever
+reaches `SearchCoordinator`. It discovers every live instance of a service
+name via the phase-0 `ServiceRegistry`, groups them by the `shard_id` each one
+carries in its `ServiceInstance.metadata` (the convention this phase adds:
+every shard replica registers with `metadata={"shard_id": str(shard_id)}`),
+and picks **exactly one** instance per `shard_id` — the lexicographically
+smallest `service_id` among the live candidates. The result — one
+`ShardTarget` per `shard_id`, never two for the same one — is exactly the
+shape `SearchCoordinator` already expects and already handles correctly; nothing
+about the coordinator, the transport, or the merge changes.
+
+**Why the smallest `service_id`, not "first in whatever order `discover`
+returns"**: `ServiceRegistry.discover` (`protocols.py`) explicitly documents
+its result as "in any order — the caller decides the strategy" — relying on
+that order would make the chosen replica flap between calls for no reason
+whenever the underlying registry (Consul's `/v1/health/service`, or a plain
+`dict` in `InMemoryServiceRegistry`) happens to reorder its response, even
+though every candidate is still alive and equally valid. A deterministic tie-break
+means the chosen replica only ever changes when it actually has to — when the
+previously-chosen one stops being among the live instances `discover` returns
+— which is real failover, not cosmetic alternation. `tests/test_query_shard_discovery.py`
+asserts this directly (`test_choice_only_changes_when_the_chosen_replica_stops_being_alive`).
+
+**Why failover is "discover again", not an active health check of this
+phase's own**: this phase deliberately adds no new liveness mechanism. A shard
+replica's liveness is already the phase-0 `ServiceRegistry`'s job — TTL
+health checks in Consul, TTL-tracked heartbeats in `InMemoryServiceRegistry`
+(see phase 0, section 4) — and `resolve_shard_targets` is called fresh before
+every single query (`DistributedQueryServingPipeline._current_coordinator`,
+`query/pipeline.py`), so the *next* query after a replica's TTL expires
+already sees a `ShardTarget` list without it, and picks the next live replica
+of that `shard_id` if one exists. Building a second, phase-5-specific health
+check on top would duplicate exactly the liveness bookkeeping phase 0 already
+solved once, the same reasoning phase 0 itself gives for choosing Consul over
+a hand-rolled KV store (see "Service registry" above). A `shard_id` with zero
+live replicas at query time simply has no entry in the resolved target list —
+that partition is absent from the fan-out for that one query, the identical
+degradation shape `SearchCoordinator` already produces for a shard that times
+out or errors, just resolved one step earlier and for a different reason.
+
+### 1. The shard-index batch job — partitioning fase 3's global index once, not per replica
+
+**Decision:** `ShardIndexPipeline` (`query/shard_index_pipeline.py`, exposed as
+the `shard-index` CLI subcommand) downloads whatever phase 3 left at
+`search-index-compressed/` (or `search-index/`, if `build-index` ran with
+`--no-compress`) from the phase-0 `ObjectStorage`, calls
+`distributed_index_sharding.partitioning.partition_index` **unmodified** to
+produce `num_shards` self-contained shard directories plus a
+`cluster_manifest.json`, and uploads every file of every shard directory back
+to `ObjectStorage` under `shard-index/shard-<id>/`. Like `build-index`
+(phase 3) and `compute-pagerank` (phase 4), this is a one-shot batch job, not
+a `docker-compose.yml` service: it needs phase 3's global index to already be
+finished, and re-running it (to change `num_shards`, or to re-shard after a
+new crawl) is an explicit, occasional operator action, not something a
+long-running container should retry on a loop — see `README.md`, "Usage
+(CLI)" for the exact invocation, the same pattern already established for
+`build-index`/`compute-pagerank`.
+
+**Why shard directories round-trip through `ObjectStorage` instead of a
+shared volume**: a shard replica (section 2 below) can be scheduled on any
+container/host — that is the entire point of moving off
+`LocalShardCluster`'s single-parent-process subprocesses — so its shard data
+has to be reachable from wherever it starts, which a Docker bind mount or a
+Kubernetes hostPath cannot guarantee across machines. `ObjectStorage` is
+already the one storage primitive every phase agrees is reachable from any
+worker (see phase 0, section 1); reusing it here instead of introducing a
+second, container-specific distribution mechanism costs one upload and one
+download of a few flat files per shard, not a new architectural concept.
+
+**Why the downloaded/re-uploaded directories are always flat, never
+recursive in a meaningful way**: both possible source formats — the
+uncompressed `inverted-index-builder` layout (`manifest.json`,
+`documents.jsonl`, `postings.jsonl`, `stats.json`) and the compressed
+`index-compression-codec` layout (`manifest.json`, `documents.jsonl`,
+`terms.jsonl`, `postings.bin`, `stats.json`, `compression_stats.json`) — are
+themselves flat directories of sibling files (see each project's own README,
+"Data formats"), and `partition_index`'s own output (`shard-<id>/manifest.json`
++ `documents.jsonl` + `postings.jsonl` + `stats.json`, always uncompressed —
+see that function's own module docstring, "Por qué cada shard se escribe en
+formato sin comprimir") is flat too. `_download_directory`/`_upload_directory`
+(`query/shard_index_pipeline.py`) reflect that directly: list one prefix
+level, download or upload every file found there, skip anything with a
+further `/` in its key. No general-purpose recursive object-tree sync is
+built because none of this phase's data shapes ever need one.
+
+### 2. Serving a shard replica — `ShardReplicaService`, one subprocess of `serve-shard` per container
+
+**Decision:** `ShardReplicaService` (`query/shard_replica_service.py`, exposed
+as the `shard-replica` CLI subcommand) is this phase's equivalent of
+`LocalShardCluster`, narrowed to a single replica and pointed at real
+infrastructure instead of local subprocess bookkeeping:
+
+1. downloads its own `shard-index/shard-<id>/` prefix from `ObjectStorage`
+   into a local temporary directory (never the whole `shard-index/` tree —
+   only the one shard this replica is configured to serve);
+2. launches `python -m distributed_index_sharding serve-shard <dir>
+   --shard-id <id> --host <host> --port <port>` as a real OS subprocess —
+   the exact same invocation `LocalShardCluster.start` already uses, just one
+   at a time instead of `num_shards` at once under one parent;
+3. polls `GET /health` until it responds (the same polling shape
+   `LocalShardCluster._wait_until_healthy` already uses, reimplemented here
+   at the scope of one target because that method is not exposed as a
+   reusable, standalone helper on `LocalShardCluster`);
+4. registers itself in the phase-0 `ServiceRegistry` with
+   `metadata={"shard_id": str(shard_id)}` (the convention section 0 depends
+   on) and a configurable TTL;
+5. renews that TTL on a fixed interval for as long as the process runs.
+
+**Why a wrapper process around `serve-shard`, not a modified
+`shard_server.py`**: the shard HTTP server itself (loading a
+`BM25RankingPipeline`, answering `/search`/`/health`) is exactly
+`distributed-index-sharding`'s job and stays untouched; everything this phase
+adds — downloading shard data from a networked store, registering with a
+service registry, renewing a heartbeat — is orchestration around an unmodified
+binary, the same "materialize input, call the unmodified function/subprocess,
+handle only what it cannot do itself" shape phases 3 and 4 already used for
+`IndexBuilder.build` and `PageRankPipeline` respectively.
+
+**Graceful shutdown vs. an ungraceful kill — the two paths this phase has to
+support, and why only one of them runs any code at all**: `shutdown()`
+cancels the heartbeat loop, explicitly deregisters from the `ServiceRegistry`,
+then terminates the `serve-shard` subprocess (`SIGTERM`, `SIGKILL` after a
+grace period) — the path a `docker stop`/`docker compose down` (`SIGTERM` to
+the container's PID 1, handled by an explicit `signal.SIGTERM` handler
+installed in the `shard-replica` CLI entrypoint, `__main__.py`) takes. A
+`docker kill` (`SIGKILL`) — and the real scenario this phase's Definition of
+Done requires testing, a container simply dying — gives this process no
+opportunity to run *any* cleanup code, deregister included. That is not a gap
+in this design; it is the exact scenario `ServiceRegistry`'s TTL contract
+already exists to cover (phase 0, section 4: "a shard that dies without
+warning must not keep appearing alive forever"). Once the heartbeat stops
+arriving, Consul's TTL check goes critical (or `InMemoryServiceRegistry`'s own
+TTL bookkeeping expires it) after `ttl_seconds`, and `discover()` — called
+fresh before the very next query, see section 0 — simply stops returning that
+replica. `ShardReplicaService.kill_process()` exists specifically to exercise
+this path in tests without needing a real `docker kill`
+(`tests/test_query_shard_replica_service.py::test_ungraceful_kill_is_only_noticed_after_ttl_expiry`),
+the same role `LocalShardCluster.kill(shard_id)` already plays for
+`distributed-index-sharding`'s own end-to-end test.
+
+### 3. `docker-compose.yml` topology — one service per `shard_id`, not one scalable `shard` service
+
+**Decision:** unlike `crawl-worker`/`extract-worker` (phases 1–2), where every
+replica is interchangeable and a single `docker compose up --scale
+crawl-worker=N` is enough, this phase adds three separate services —
+`shard-0`, `shard-1`, `shard-2` — each running the same image with a
+different `--shard-id`, each independently scalable
+(`docker compose up -d --scale shard-0=2`).
+
+**Why not one `shard` service parameterized by an environment variable**:
+Compose replicas of the *same* service always share the same service-level
+environment — there is no way to hand replica 1 `SHARD_ID=0` and replica 2
+`SHARD_ID=1` under one `--scale shard=N`. Shards are not interchangeable the
+way crawl/extract workers are (each owns a disjoint partition of `doc_id`s,
+see `distributed-index-sharding`'s own partitioning rationale): a query
+missing shard 1 entirely because two containers both happened to load shard
+0 is a correctness bug, not graceful degradation. One Compose service per
+`shard_id`, each independently scaled, is the minimum structure that lets
+`--scale shard-0=2` mean "two redundant replicas of the same partition"
+unambiguously — the exact requirement this phase's Definition of Done names
+("al menos una réplica por shard sin que la caída de una tumbe esa
+partición").
+
+**Why no host ports are published**: `crawl-worker`/`extract-worker` never
+needed inbound reachability (nothing calls them); shard replicas are the
+first service in this repo that another process — the query-serving
+coordinator layer itself — has to be able to reach. That reachability is
+exactly what `ServiceRegistry` discovery is for: `shard-replica` announces
+itself with `socket.gethostname()` (`_default_announce_host`,
+`shard_replica_service.py`) as its `host`, the same short, Docker-assigned,
+per-container hostname `crawl-worker`/`extract-worker` already use as their
+default `--worker-id` (see their own environment comments in
+`docker-compose.yml`) — resolvable by any other container on the same
+user-defined bridge network. Publishing a fixed host port per shard would
+both be redundant with this (nothing outside the Compose network needs to
+reach a shard directly) and actively wrong once a service is scaled past one
+replica (Compose cannot bind two replicas of the same service to the same
+host port).
+
+**Why `shard-index` is a CLI job, not a fourth Compose service**: same
+reasoning phase 3/4 already established for `build-index`/`compute-pagerank`
+— a one-shot operator action that must run after a prior phase's batch job
+finished, not a process a container should hold open or retry on a timer (see
+`README.md`, "Usage (CLI)"). `shard-0`/`shard-1`/`shard-2` tolerate
+`shard-index` not having run yet: `ShardReplicaService.start` raises
+`QueryServingError` when its shard's prefix is empty, `main()` reports it and
+exits non-zero, and `restart: on-failure` retries the container — the
+container simply keeps retrying until an operator runs `shard-index`, instead
+of crash-looping opaquely or silently serving nothing.
+
+### 4. `search` — a CLI demo of dynamic discovery, not a new network-facing service
+
+`DistributedQueryServingPipeline` (`query/pipeline.py`) is this phase's
+equivalent of `distributed_index_sharding.pipeline.DistributedSearchPipeline`:
+it ties discovery (section 0) to `SearchCoordinator`, exposing the same
+`search_text`/`search_parsed_query` calls. It keeps one `aiohttp.ClientSession`
+open for its whole lifetime (the same connection-pooling reasoning
+`HttpShardTransport` already applies within one search) but re-resolves the
+`ShardTarget` list — a cheap, local `ServiceRegistry.discover` call, never a
+network round trip to a shard — on every call, rather than fixing it once at
+construction time the way `DistributedSearchPipeline` fixes its targets from
+`LocalShardCluster.start`. The `search` CLI subcommand is a thin demo of this
+programmatic API (mirroring `distributed-index-sharding`'s own `search`
+subcommand, but discovering targets instead of taking `--shard` flags) —
+this phase does not stand up a persistent, network-facing query API service
+of its own; that is `beacon-search-console`'s job, a future consumer of this
+same `DistributedQueryServingPipeline` class.
+
+### Testing this phase
+
+- **Discovery logic in isolation** (`tests/test_query_shard_discovery.py`):
+  against `InMemoryServiceRegistry` directly, no network — one target per
+  `shard_id`, deterministic tie-break among live replicas, failover only
+  when the chosen replica stops being alive, and the two error conditions
+  (`shard_id` metadata missing or non-numeric).
+- **Fan-out, merge and failover over real HTTP, no subprocess**
+  (`tests/test_query_pipeline.py`): real `distributed_index_sharding.shard_server`
+  apps served by `aiohttp.test_utils.TestServer` (real sockets, not a fake
+  transport), registered in `InMemoryServiceRegistry` — a healthy merge
+  across two shards, degradation when one shard's server is closed without
+  being deregistered (the real window between "a shard dies" and "the
+  registry notices" that this phase's design in section 0 explicitly leaves
+  to `distributed-index-sharding`'s own tolerance, not to discovery), and
+  failover between two live replicas of the same `shard_id` after the chosen
+  one is closed and deregistered.
+- **A real `serve-shard` subprocess, end-to-end** (`tests/test_query_shard_replica_service.py`):
+  `ShardReplicaService` against a real OS subprocess and
+  `InMemoryServiceRegistry` — registration with correct `shard_id` metadata,
+  a real query answered over a real socket, graceful shutdown deregistering
+  immediately, and the ungraceful-kill path (`kill_process()`) only being
+  noticed by `discover()` after TTL expiry, never immediately — plus one test
+  chaining `ShardIndexPipeline` directly into `ShardReplicaService` with no
+  manual step in between, the same handoff `docker-compose.yml`'s `shard-0`/
+  `shard-1`/`shard-2` rely on in practice.
+- **Real containers, not subprocesses** (`tests/test_query_docker_shard_failover.py`):
+  brings up `minio`/`consul` plus `shard-0` (scaled to 2 replicas) and
+  `shard-1` (1 replica) from this repo's actual `docker-compose.yml` via the
+  `docker compose` CLI, runs `shard-index` against the running MinIO, then
+  (a) `docker kill`s one of the two `shard-0` containers and asserts the
+  partition keeps answering through its surviving replica, and (b) `docker
+  kill`s the only `shard-1` container and asserts the coordinator degrades
+  (that partition's documents missing from the merged result) without
+  raising — the same criterion
+  `distributed-index-sharding/tests/test_cluster_end_to_end.py` already
+  applies to a killed local subprocess, here against a container Docker
+  itself scheduled and can no longer be reached at all. Skipped automatically
+  if the Docker daemon is not reachable, the same guard this ecosystem
+  already applies to any test that needs real external infrastructure it
+  cannot assume is running.
+
+### Known limitations
+
+- **`num_shards` is fixed by whichever `shard-index` run is currently
+  deployed.** Changing it means re-running `shard-index` with a different
+  `--num-shards` (which reshuffles every `doc_id % num_shards` assignment,
+  see `distributed-index-sharding`'s own partitioning rationale) and
+  restarting every shard replica against the new output — there is no live
+  re-sharding, the identical caveat that repo's own README already states in
+  "Adding or removing a shard without downtime" for changing `num_shards`
+  specifically (as opposed to just adding capacity to an existing shard,
+  which this phase's per-`shard_id` replica scaling already handles without
+  downtime).
+- **A `ServiceRegistry` that itself restarts with no persistent state
+  (`InMemoryServiceRegistry` in a restarted process, or a fresh Consul agent
+  with no data) is not recovered from by a running replica.** `heartbeat`
+  renews an existing registration; it does not detect "the registry forgot
+  me entirely" and re-`register`. In development, Consul's `-dev` agent
+  (`docker-compose.yml`) already loses all state on restart for the same
+  reason phase 0 accepted it (a single in-memory agent, no quorum, no
+  persistence — see "Service registry" above); a replica surviving a Consul
+  restart would need to notice `heartbeat` failing and fall back to
+  `register` again, which `_heartbeat_loop` (`shard_replica_service.py`)
+  currently logs and retries as if the failure were transient. Not fixed
+  here because a development Consul restarting is rare and already a known,
+  accepted gap of using `-dev` mode; revisit if a production Consul cluster
+  (not `-dev`) is still found to restart often enough for this to matter.
+- Same general principle every prior phase applies: nothing in this phase
+  aborts a whole query over one shard's failure (`SearchCoordinator`'s own
+  guarantee, reused unmodified) or over one replica's registration failing
+  at startup (`ShardReplicaService.start` raises with enough context to
+  identify which `shard_id`/`bucket` was misconfigured, rather than a bare
+  stack trace from `distributed-index-sharding` or the registry SDK).
+
+### Non-goals of phase 5
+
+This phase does not: reimplement partitioning, the shard HTTP server,
+fan-out, or merge (all `distributed-index-sharding`, unmodified), rerank
+results with `learning-to-rank-reranker` or combine BM25 with the
+`pagerank_scores.jsonl` phase 4 produced (a future phase's job, likely inside
+`beacon-search-console` once it consumes `DistributedQueryServingPipeline`),
+support live re-sharding when `num_shards` changes (see "Known limitations"
+above), or stand up a persistent, network-facing search API service of its
+own (`search` is a CLI demo of the programmatic pipeline, not that service).
+It hands a future `beacon-search-console` integration a
+`DistributedQueryServingPipeline` that already discovers shards dynamically,
+tolerates individual replica failure, and fails over between redundant
+replicas of the same partition, ready to sit behind a real HTTP API.
+
+### Evolution to Kubernetes (documented, not implemented, in this phase)
+
+Following the same "Compose now, Kubernetes as the deliberate next step"
+reasoning phase 0 already established (see "Orchestration" above) and phase
+1's own Kubernetes section (`Deployment`s registering themselves in Consul on
+boot):
+
+- Each `shard-N` Compose service becomes its own Kubernetes `Deployment`
+  (`shard-0`, `shard-1`, `shard-2`, ...) with `spec.replicas` set to the
+  desired redundancy for that partition — the same one-Deployment-per-`shard_id`
+  shape `docker-compose.yml` already uses and for the same reason (section 3
+  above): shards are not interchangeable, so there is no single Deployment
+  that could scale them symmetrically. A `HorizontalPodAutoscaler` per shard
+  Deployment (on query latency or CPU) is a natural later addition once query
+  volume, not just redundancy, is the concern — out of scope here, the same
+  "revisit only if profiling shows otherwise" bar phase 3/4 already apply to
+  their own scaling questions.
+- `ShardReplicaService`'s download-then-serve startup sequence maps directly
+  onto a Kubernetes **init container**: an init container running
+  `beacon-scale-infra shard-index`'s download half (or a dedicated
+  "fetch this shard's data" entrypoint) populates an `emptyDir` volume shared
+  with the main container, which then runs plain `distributed-index-sharding
+  serve-shard` against that already-populated local path — splitting
+  "fetch my partition" from "serve my partition" the way Kubernetes expects,
+  instead of one process doing both sequentially as `ShardReplicaService`
+  does today for Compose's simpler single-process-per-container model.
+- **Registration and heartbeating are replaced by Kubernetes' own liveness
+  primitives, not carried over as-is**: a `readinessProbe` against `GET
+  /health` (already exposed by `shard_server.py`, unmodified) replaces this
+  phase's own HTTP polling in `_wait_until_healthy`, and a pod that fails its
+  `livenessProbe` is restarted by the kubelet without this phase's code
+  needing to run any cleanup at all — the exact same "no code runs, the
+  platform notices independently" shape `ServiceRegistry` TTL expiry already
+  gives this phase for an ungraceful container kill (section 2 above), just
+  provided by the orchestrator instead of by Consul. Whether Consul continues
+  to be the discovery mechanism (each pod still running a Consul agent
+  sidecar and calling `ServiceRegistry.register`, as phase 0's own Kubernetes
+  section already describes for future compute in general) or is replaced by
+  a Kubernetes `Service` with a headless `ClusterIP: None` DNS record
+  enumerating one A-record per ready pod is a choice this phase does not
+  need to make yet — `resolve_shard_targets` only depends on the
+  `ServiceRegistry` protocol (phase 0), so swapping what implements discovery
+  never touches `query/shard_discovery.py` or `query/pipeline.py`, the same
+  protocol-first insulation phase 0 designed this substrate to give every
+  later phase.
+- **Pod anti-affinity, not this phase's own logic, guarantees redundancy
+  survives a node failure**: `resolve_shard_targets`'s failover already
+  tolerates *a* replica dying, but two replicas of `shard-0` scheduled on the
+  same Kubernetes node both disappear together if that node fails — a
+  `podAntiAffinity` rule (prefer, or require, distinct nodes for replicas of
+  the same shard Deployment) is how a real cluster deployment closes that
+  gap, configured entirely in the Deployment's pod spec, with zero change to
+  this phase's code.
+- The `shard-index` batch job becomes a Kubernetes `Job` (not a `CronJob`,
+  matching phase 3/4's own framing of `build-index`/`compute-pagerank` as
+  "run once, or whenever the corpus changes, not on a recurring schedule")
+  invoked by an operator (or a future CI/CD pipeline step) after `build-index`'s
+  own `Job` completes — the identical one-shot-batch-vs-long-running-service
+  distinction this phase already draws for Compose (section 3 above),
+  carried over unchanged.
