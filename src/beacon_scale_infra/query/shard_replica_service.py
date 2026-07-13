@@ -36,11 +36,18 @@ from typing import Final
 
 import aiohttp
 
-from beacon_scale_infra.errors import QueryServingError, ServiceRegistryError
+from beacon_scale_infra.errors import ObjectNotFoundError, QueryServingError, ServiceRegistryError
+from beacon_scale_infra.index.index_version import (
+    INDEX_VERSION_MARKER_BASENAME,
+    parse_index_version_marker,
+)
 from beacon_scale_infra.models import ServiceInstance
 from beacon_scale_infra.protocols import ObjectStorage, ServiceRegistry
 from beacon_scale_infra.query.models import ShardReplicaConfig
-from beacon_scale_infra.query.shard_discovery import SHARD_ID_METADATA_KEY
+from beacon_scale_infra.query.shard_discovery import (
+    INDEX_VERSION_METADATA_KEY,
+    SHARD_ID_METADATA_KEY,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -69,11 +76,13 @@ class ShardReplicaService:
         process: asyncio.subprocess.Process,
         registry: ServiceRegistry,
         shard_dir: Path,
+        index_version: str | None,
     ) -> None:
         self._config = config
         self._process = process
         self._registry = registry
         self._shard_dir = shard_dir
+        self._index_version = index_version
         self._heartbeat_task: asyncio.Task[None] | None = None
 
     @classmethod
@@ -92,6 +101,7 @@ class ShardReplicaService:
                 f"no hay ningún objeto bajo {config.shard_object_prefix!r} en el bucket "
                 f"{config.bucket!r}: ¿ha terminado 'shard-index' para este shard_id?"
             )
+        index_version = await cls._read_index_version(storage, config)
 
         process = await asyncio.create_subprocess_exec(
             sys.executable,
@@ -106,7 +116,7 @@ class ShardReplicaService:
             "--port",
             str(config.port),
         )
-        service = cls(config, process, registry, shard_dir)
+        service = cls(config, process, registry, shard_dir, index_version)
         try:
             await service._wait_until_healthy()
             await service._register()
@@ -123,6 +133,32 @@ class ShardReplicaService:
             config.port,
         )
         return service
+
+    @staticmethod
+    async def _read_index_version(storage: ObjectStorage, config: ShardReplicaConfig) -> str | None:
+        """Versión de contenido del índice que este `shard-index/` sirve
+        (propagada por `ShardIndexPipeline` desde el marcador de fase 3).
+        `None` si el prefijo se particionó con una versión de `shard-index`
+        anterior al marcador: la réplica arranca y sirve igualmente (metadata
+        sin versión), pero la consola no podrá validar coherencia ni cachear
+        contra ella -- degradación explícita, nunca un arranque fallido por
+        un artefacto antiguo. Un marcador presente pero ilegible sí es error:
+        indica corrupción, no antigüedad."""
+        marker_key = f"{config.shard_index_prefix}/{INDEX_VERSION_MARKER_BASENAME}"
+        try:
+            raw = await storage.get_object(config.bucket, marker_key)
+        except ObjectNotFoundError:
+            logger.warning(
+                "sin marcador de versión de índice en %r: la réplica de shard %s se anuncia "
+                "sin 'index_version' (re-ejecuta 'shard-index' para publicarlo)",
+                marker_key,
+                config.shard_id,
+            )
+            return None
+        try:
+            return parse_index_version_marker(raw)
+        except ValueError as exc:
+            raise QueryServingError(f"marcador {marker_key!r} ilegible: {exc}") from exc
 
     @staticmethod
     async def _download_shard(
@@ -172,12 +208,15 @@ class ShardReplicaService:
 
     async def _register(self) -> None:
         announce_host = self._config.announce_host or _default_announce_host()
+        metadata = {SHARD_ID_METADATA_KEY: str(self._config.shard_id)}
+        if self._index_version is not None:
+            metadata[INDEX_VERSION_METADATA_KEY] = self._index_version
         instance = ServiceInstance(
             service_id=self._config.service_id,
             service_name=self._config.service_name,
             host=announce_host,
             port=self._config.port,
-            metadata={SHARD_ID_METADATA_KEY: str(self._config.shard_id)},
+            metadata=metadata,
         )
         await self._registry.register(instance, ttl_seconds=self._config.ttl_seconds)
 

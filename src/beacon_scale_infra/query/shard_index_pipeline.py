@@ -20,7 +20,12 @@ from typing import Final
 
 from distributed_index_sharding.partitioning import partition_index
 
-from beacon_scale_infra.errors import ShardIndexingError
+from beacon_scale_infra.errors import ObjectNotFoundError, ShardIndexingError
+from beacon_scale_infra.index.index_version import (
+    INDEX_VERSION_MARKER_BASENAME,
+    index_version_marker_body,
+    parse_index_version_marker,
+)
 from beacon_scale_infra.protocols import ObjectStorage
 from beacon_scale_infra.query.models import ShardIndexingStats, ShardIndexPipelineConfig
 
@@ -44,6 +49,8 @@ class ShardIndexPipeline:
             source_dir = work_dir / "source-index"
             source_dir.mkdir()
 
+            index_version = await self._read_source_index_version()
+
             downloaded = await self._download_directory(
                 self._config.source_index_prefix, source_dir
             )
@@ -62,6 +69,16 @@ class ShardIndexPipeline:
                 ) from exc
 
             uploaded = await self._upload_directory(output_root, self._config.shard_index_prefix)
+            # El marcador de versión de fase 3 se propaga al prefijo de
+            # shards: es lo que cada réplica anuncia en su metadata de
+            # registro y lo que namespacea la caché de resultados de la
+            # consola (ver ARCHITECTURE.md, fases 3 y 6).
+            await self._storage.put_object(
+                self._config.bucket,
+                f"{self._config.shard_index_prefix}/{INDEX_VERSION_MARKER_BASENAME}",
+                index_version_marker_body(index_version),
+                content_type="application/json",
+            )
 
         return ShardIndexingStats(
             num_shards=manifest.num_shards,
@@ -69,13 +86,38 @@ class ShardIndexPipeline:
             shard_files_uploaded=uploaded,
         )
 
+    async def _read_source_index_version(self) -> str:
+        """Versión de contenido que `build-index` dejó junto al índice de
+        origen. Obligatoria: sin ella, las réplicas de shard no podrían
+        anunciar qué build sirven y la consola no tendría contra qué validar
+        ni namespacear su caché -- mejor fallar aquí, con el remedio claro
+        (re-ejecutar `build-index`, que ya la escribe siempre), que servir
+        shards de procedencia desconocida."""
+        marker_key = f"{self._config.source_index_prefix}/{INDEX_VERSION_MARKER_BASENAME}"
+        try:
+            raw = await self._storage.get_object(self._config.bucket, marker_key)
+        except ObjectNotFoundError as exc:
+            raise ShardIndexingError(
+                f"no existe {marker_key!r} en el bucket {self._config.bucket!r}: el índice de "
+                "origen se construyó con una versión de 'build-index' anterior al marcador de "
+                "versión -- re-ejecuta 'build-index' antes de 'shard-index'"
+            ) from exc
+        try:
+            return parse_index_version_marker(raw)
+        except ValueError as exc:
+            raise ShardIndexingError(f"marcador {marker_key!r} ilegible: {exc}") from exc
+
     async def _download_directory(self, object_prefix: str, local_dir: Path) -> int:
         """Descarga los objetos directos bajo `object_prefix/` a `local_dir`.
 
         El índice de origen (comprimido o no) es siempre un directorio plano
         de ficheros -- ver `index-compression-codec`/`inverted-index-builder`,
         secciones *Data formats* -- así que cualquier clave con un nivel de
-        prefijo adicional no pertenece a él y se ignora.
+        prefijo adicional no pertenece a él y se ignora. El marcador de
+        versión que `build-index` publica como hermano del índice tampoco
+        forma parte del formato que `partition_index` espera: se lee aparte
+        (`_read_source_index_version`), nunca se materializa en el directorio
+        de origen.
         """
         count = 0
         async for entry in self._storage.list_objects(
@@ -83,6 +125,8 @@ class ShardIndexPipeline:
         ):
             relative_name = entry.key[len(object_prefix) + 1 :]
             if not relative_name or "/" in relative_name:
+                continue
+            if relative_name == INDEX_VERSION_MARKER_BASENAME:
                 continue
             data = await self._storage.get_object(self._config.bucket, entry.key)
             (local_dir / relative_name).write_bytes(data)

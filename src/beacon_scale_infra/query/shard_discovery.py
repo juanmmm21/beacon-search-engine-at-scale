@@ -21,8 +21,15 @@ from beacon_scale_infra.protocols import ServiceRegistry
 
 SHARD_ID_METADATA_KEY = "shard_id"
 
+INDEX_VERSION_METADATA_KEY = "index_version"
+"""Versión de contenido del índice que la réplica sirve (ver
+`index/index_version.py`). Opcional en la metadata -- una réplica arrancada
+sobre un `shard-index/` sin marcador no la anuncia --, pero sin ella la
+consola (fase 6) no puede validar la coherencia réplica<->artefactos ni
+cachear los resultados de esa búsqueda (ver `console/cluster_search.py`)."""
 
-def _shard_id_of(instance: ServiceInstance) -> int:
+
+def shard_id_of(instance: ServiceInstance) -> int:
     raw = instance.metadata.get(SHARD_ID_METADATA_KEY)
     if raw is None:
         raise QueryServingError(
@@ -56,13 +63,23 @@ async def resolve_shard_targets(
     un shard que no responde.
     """
     instances = await registry.discover(service_name)
+    return tuple(
+        ShardTarget(shard_id=shard_id_of(instance), host=instance.host, port=instance.port)
+        for instance in choose_shard_instances(instances)
+    )
+
+
+def choose_shard_instances(instances: list[ServiceInstance]) -> tuple[ServiceInstance, ...]:
+    """Elige exactamente una instancia por `shard_id` presente en
+    `instances`, ordenadas ascendentemente por `shard_id` -- el mismo
+    criterio determinista (menor `service_id` lexicográfico) que documenta
+    `resolve_shard_targets`, expuesto sobre las instancias completas para que
+    un llamador que necesite su metadata (la consola de fase 6 lee
+    `index_version`) no tenga que repetir la agrupación por su cuenta."""
     chosen_by_shard: dict[int, ServiceInstance] = {}
     for instance in instances:
-        shard_id = _shard_id_of(instance)
+        shard_id = shard_id_of(instance)
         current = chosen_by_shard.get(shard_id)
         if current is None or instance.service_id < current.service_id:
             chosen_by_shard[shard_id] = instance
-    return tuple(
-        ShardTarget(shard_id=shard_id, host=instance.host, port=instance.port)
-        for shard_id, instance in sorted(chosen_by_shard.items())
-    )
+    return tuple(instance for _shard_id, instance in sorted(chosen_by_shard.items()))
