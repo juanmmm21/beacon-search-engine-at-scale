@@ -19,10 +19,11 @@
 # cada uno independientemente escalable a varias réplicas para tolerar la
 # caída de una sin perder esa partición.
 #
-# 'build-index' (fase 3), 'compute-pagerank' (fase 4) y 'shard-index' (fase
-# 5, particiona el índice global en shards) son jobs por lotes de un solo
-# disparo, no servicios de este fichero -- se invocan a mano desde el host
-# contra esta misma infraestructura (ver README.md, "Uso (CLI)").
+# 'build-index' (fase 3), 'compute-pagerank' (fase 4), 'shard-index' (fase
+# 5, particiona el índice global en shards) y 'train-reranker' (fase 6,
+# publica el modelo LTR) son jobs por lotes de un solo disparo, no servicios
+# de este fichero -- se invocan a mano desde el host contra esta misma
+# infraestructura (ver README.md, "Uso (CLI)").
 #
 # Uso:
 #   docker compose up -d                               # sustrato + workers
@@ -34,6 +35,9 @@
 #   docker compose up -d shard-0 shard-1 shard-2
 #   docker compose up -d --scale shard-0=2          # 2 réplicas del shard 0
 #   docker compose kill beacon-search-engine-at-scale-shard-0-1   # matar 1 réplica de verdad
+#   # Tras train-reranker (fase 6, ver README.md):
+#   docker compose up -d console-api console-lb    # API + balanceador en :8080
+#   docker compose up -d --scale console-api=2 console-api   # 2 réplicas de la API
 #   docker compose down -v                     # borra también los volúmenes de datos
 
 services:
@@ -262,6 +266,61 @@ services:
       - 0.0.0.0
       - --port
       - "9300"
+    networks: [beacon-scale]
+    restart: on-failure
+
+  # --- Fase 6: API de la consola multi-réplica + balanceador ---------------
+  #
+  # 'console-api' es la app insignia (beacon-search-console) servida sobre el
+  # clúster de shards de fase 5: cada réplica descarga los artefactos del
+  # índice de MinIO al arrancar, descubre los shards vivos vía Consul en cada
+  # búsqueda y comparte la caché de resultados en el Redis de fase 0 (ver
+  # ARCHITECTURE.md, fase 6). A diferencia del backend original de
+  # beacon-search-console, ninguna réplica arranca subprocesos de shard ni
+  # fija puertos de shard locales: las réplicas son intercambiables y se
+  # escalan con 'docker compose up -d --scale console-api=N'.
+  #
+  # Ningún puerto de 'console-api' se publica al host (dos réplicas no
+  # podrían compartirlo): el único punto de entrada es 'console-lb', un nginx
+  # que balancea en round-robin vía el DNS embebido de Docker (ver
+  # deploy/console-lb.nginx.conf).
+  #
+  # Requiere que los jobs por lotes hayan corrido antes (README.md, "Serving
+  # the console (phase 6)"): build-index, compute-pagerank, shard-index y
+  # train-reranker; 'restart: on-failure' reintenta el arranque mientras
+  # falte algún artefacto, igual que los servicios shard-N con 'shard-index'.
+  console-api:
+    build: .
+    depends_on:
+      minio-init:
+        condition: service_completed_successfully
+      consul:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      BEACON_S3_ENDPOINT_URL: http://minio:9000
+      BEACON_S3_ACCESS_KEY: beacon-dev
+      BEACON_S3_SECRET_KEY: beacon-dev-secret
+      BEACON_CONSUL_BASE_URL: http://consul:8500
+      BEACON_REDIS_URL: redis://redis:6379/0
+    command:
+      - serve-console
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+    networks: [beacon-scale]
+    restart: on-failure
+
+  console-lb:
+    image: nginx:1.27-alpine
+    depends_on:
+      - console-api
+    volumes:
+      - ./deploy/console-lb.nginx.conf:/etc/nginx/conf.d/default.conf:ro
+    ports:
+      - "8080:8080" # http://localhost:8080/api/v1/... -> round-robin entre réplicas
     networks: [beacon-scale]
     restart: on-failure
 
