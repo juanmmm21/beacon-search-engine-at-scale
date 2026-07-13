@@ -37,22 +37,31 @@ through the phase-0 service registry instead of a fixed list of shard
 addresses, so that redundant replicas of the same shard fail over into each
 other without the caller ever holding a stale target list (see
 [`ARCHITECTURE.md`](ARCHITECTURE.md), "Phase 5 — Distributed query serving").
-See [`ARCHITECTURE.md`](ARCHITECTURE.md) for the full reasoning behind every
-decision across all five phases, the alternatives considered, and how each
-piece of phase 0 is meant to evolve toward Kubernetes.
+Phase 6 puts the flagship application — `beacon-search-console`, reused as a
+real package dependency with its `/api/v1` contract and React frontend
+unchanged — in front of that cluster: a FastAPI service runnable as N
+interchangeable replicas behind a load balancer, discovering shards
+dynamically instead of spawning its own, resolving snippets on demand against
+the phase-2 partitions instead of loading the whole corpus per replica, and
+sharing a Redis result cache namespaced by a content hash of the index build
+so a rebuilt index can never silently serve stale results (see
+[`ARCHITECTURE.md`](ARCHITECTURE.md), "Phase 6 — The console over the real
+cluster"). See [`ARCHITECTURE.md`](ARCHITECTURE.md) for the full reasoning
+behind every decision across all phases, the alternatives considered, and how
+each piece of phase 0 is meant to evolve toward Kubernetes.
 
-This repo does not implement a query server of its own (see "Distributed
-query serving (phase 5)" below for exactly what it does instead), and it does
-not modify any of the ten existing `beacon-search-engine` repositories —
-`web-crawler-scheduler`'s own crawler logic (see "Distributed crawling (phase
-1)" below), `html-content-extractor`'s own extraction logic (see "Distributed
-extraction (phase 2)" below), `inverted-index-builder`'s /
+This repo does not modify any of the ten existing `beacon-search-engine`
+repositories — `web-crawler-scheduler`'s own crawler logic (see "Distributed
+crawling (phase 1)" below), `html-content-extractor`'s own extraction logic
+(see "Distributed extraction (phase 2)" below), `inverted-index-builder`'s /
 `index-compression-codec`'s own indexing and compression logic (see
 "Distributed indexing (phase 3)" below), `pagerank-link-analysis`'s own
-ranking algorithm (see "PageRank (phase 4)" below), and
+ranking algorithm (see "PageRank (phase 4)" below),
 `distributed-index-sharding`'s own partitioning/fan-out/merge (see
-"Distributed query serving (phase 5)" below) are all reused as real package
-dependencies, unchanged. It is a sibling repository that later phases extend.
+"Distributed query serving (phase 5)" below) and `beacon-search-console`'s
+own API contract, snippet construction and frontend (see "Serving the console
+(phase 6)" below) are all reused as real package dependencies, unchanged. It
+is a sibling repository that later phases extend.
 
 ## Role in `beacon-search-engine`
 
@@ -147,8 +156,28 @@ beacon-search-engine-at-scale (this repo)
   └─────────────────────────────────────────────────────────┘
         |
         v
-  future phases: distributed query serving —
-  built on top of this substrate, not implemented in this repo yet
+  ┌─────────────────────────────────────────────────────────┐
+  │  phase 5 — distributed query serving (shard replicas)       │
+  │                                                             │
+  │   shard data <- phase-0 ObjectStorage (shard-index job)     │
+  │   discovery  =  phase-0 ServiceRegistry (one target per     │
+  │                 shard_id, deterministic replica choice)     │
+  │   fan-out/merge reused unchanged from                       │
+  │   distributed-index-sharding                                │
+  └─────────────────────────────────────────────────────────┘
+        |
+        v
+  ┌─────────────────────────────────────────────────────────┐
+  │  phase 6 — the console over the real cluster (N API        │
+  │  replicas behind a load balancer)                           │
+  │                                                             │
+  │   contract/frontend reused unchanged from                   │
+  │   beacon-search-console (/api/v1)                           │
+  │   shards     <- phase-5 cluster, discovered per query       │
+  │   result cache = Redis, namespaced by index version         │
+  │   snippets   <- phase-2 partitions, on demand               │
+  │   LTR model  <- train-reranker batch job -> ObjectStorage   │
+  └─────────────────────────────────────────────────────────┘
 ```
 
 ## Goal and skills demonstrated
@@ -485,11 +514,74 @@ local` invocation: neither backend coordinates across separate process
 invocations, so this only makes sense to smoke-test one replica in isolation,
 never to simulate a multi-replica cluster.
 
+## Serving the console (phase 6)
+
+`src/beacon_scale_infra/console/` serves the flagship application —
+[`beacon-search-console`](https://github.com/juanmmm21/beacon-search-console),
+reused as a real package dependency — over the phase-5 cluster, with the
+exact same versioned `/api/v1/search`, `/api/v1/autocomplete` and
+`/api/v1/index/stats` contract (the response models are literally imported
+from that package) and its React frontend running unchanged against this
+API. See [`ARCHITECTURE.md`](ARCHITECTURE.md), section "Phase 6 — The console
+over the real cluster", for the full reasoning, including the
+piece-by-piece decision of what became shared state and what is rebuilt per
+replica, and what serving the frontend from a CDN would take.
+
+| Concern | `beacon-search-console` alone | This phase |
+|---|---|---|
+| Shard processes | spawned as local subprocesses by the API itself (`DistributedSearchPipeline.start`, fixed local ports — breaks with a second API replica) | the phase-5 cluster, discovered via the phase-0 `ServiceRegistry` on every query; the API owns no shard |
+| Search results | recomputed per request, per process | shared Redis cache (`CacheStore`, phase-0 substrate), keys namespaced by the index version the live shards announce — a rebuilt index changes the namespace, so stale entries are unreachable by construction and expire by TTL |
+| Stale-index protection | none (single process, single build) | per-query verification: a shard replica announcing a different index version than the API loaded is excluded from the fan-out and reported as an explicit shard error |
+| Snippets (`doc_id -> text`) | whole `documents.jsonl` loaded into process memory, `doc_id` = line number | resolved on demand against the phase-2 part files via the corpus catalog `build-index` publishes (binary search over part ranges, bounded LRU of hot parts) |
+| Autocomplete / spellcheck / reranker / stats | loaded once per process from local `data/` | rebuilt identically per replica at startup from the immutable build artifacts in `ObjectStorage` (deterministic, so replicas cannot diverge) |
+| LTR model | trained by the bootstrap script into `data/ltr-model` | the `train-reranker` batch job (same training, unmodified) publishes it to `ObjectStorage` |
+| API replicas | exactly one | N interchangeable replicas behind `console-lb` (nginx, Docker-DNS round-robin) |
+
+### Running it
+
+```bash
+docker compose up -d                    # MinIO, Redis, Consul, bucket bootstrap
+# ... crawl + extract as in phases 1-2, then the batch jobs:
+export BEACON_S3_ENDPOINT_URL=http://localhost:9000 \
+       BEACON_S3_ACCESS_KEY=beacon-dev BEACON_S3_SECRET_KEY=beacon-dev-secret
+python -m beacon_scale_infra build-index      --storage-backend s3 --bucket beacon-scale-dev
+python -m beacon_scale_infra compute-pagerank --storage-backend s3 --bucket beacon-scale-dev
+python -m beacon_scale_infra shard-index     --storage-backend s3 --bucket beacon-scale-dev --num-shards 3
+python -m beacon_scale_infra train-reranker  --storage-backend s3 --bucket beacon-scale-dev
+
+# Shard replicas + the console API behind its load balancer
+docker compose up -d shard-0 shard-1 shard-2
+docker compose up -d console-api console-lb
+curl -s "http://localhost:8080/api/v1/search?q=python&limit=5" | python3 -m json.tool
+
+# Scale the API horizontally -- nginx picks the new replicas up via Docker DNS
+docker compose up -d --scale console-api=2 console-api
+```
+
+Killing one `console-api` replica loses nothing: any replica answers any
+request, and a cache entry written through one is read through the others.
+After re-crawling and re-running the batch jobs, restart the shard replicas
+and then the `console-api` replicas — until the APIs restart, they exclude
+the new-version shards explicitly (degraded response naming the reason)
+rather than ever mixing two builds silently.
+
+### The frontend
+
+`beacon-search-console`'s frontend is served exactly as that repo documents
+(`npm run dev` proxying `/api`, or a static `npm run build`), pointed at
+`console-lb` instead of the single-process backend — no frontend change. The
+CDN story (what is static, what must reach the backend, and what invalidates
+what) is documented in `ARCHITECTURE.md`, phase 6, section 8.
+
 ## Requirements and installation
 
 - Python `>=3.11`
 - [Docker](https://www.docker.com/) and Docker Compose, to run the real
   backends locally (MinIO, Redis, Consul)
+- On macOS, `brew install libomp` — LightGBM's OpenMP runtime, needed by
+  `learning-to-rank-reranker` (phase 6); the Docker image installs its Linux
+  equivalent (`libgomp1`) itself — the same requirement
+  `beacon-search-console` already documents
 
 ```bash
 python -m venv .venv
@@ -517,9 +609,10 @@ Git URLs (see `pyproject.toml`).
 This section covers the phase-0 substrate demo commands
 (`storage-demo`/`queue-demo`/`registry-demo`); see "Distributed crawling
 (phase 1)" above for `crawl-worker`, "Distributed extraction (phase 2)"
-above for `extract-worker`, and "Distributed query serving (phase 5)" above
-for `shard-index`/`shard-replica`/`search`. A demonstration CLI exercises
-each piece of the substrate end to end, against either backend:
+above for `extract-worker`, "Distributed query serving (phase 5)" above
+for `shard-index`/`shard-replica`/`search`, and "Serving the console (phase
+6)" above for `train-reranker`/`serve-console`. A demonstration CLI
+exercises each piece of the substrate end to end, against either backend:
 
 ```bash
 # Local backends, no Docker required
@@ -580,10 +673,27 @@ object, message, or service instance, and prints every step.
   `shard-index/cluster_manifest.json` (`{"num_shards": ..., "shard_dir_names":
   [...]}`) describing them — unmodified, see that repo's own README for the
   field-by-field contract.
-- **A shard replica's service instance metadata** carries exactly one key,
+- **A shard replica's service instance metadata** carries
   `{"shard_id": "<int>"}` — the convention `resolve_shard_targets`
   (`query/shard_discovery.py`) depends on to group live replicas by which
-  partition they serve; see `ARCHITECTURE.md`, phase 5, section 0.
+  partition they serve (see `ARCHITECTURE.md`, phase 5, section 0) — plus,
+  when the shard data was partitioned by a marker-aware `shard-index` run,
+  `{"index_version": "<sha256>"}`: the content version of the build that
+  replica is serving, which the console verifies per query (see
+  `ARCHITECTURE.md`, phase 6, section 2).
+- **The index version marker** (`index_version.json`, published next to
+  `search-index/`, `search-index-compressed/` and `shard-index/`) is
+  `{"format_version": 1, "index_version": "<sha256>"}` — a content hash over
+  the merged index files plus the corpus file, computed by `build-index`
+  (`index/index_version.py`).
+- **The corpus catalog** (`search-index/corpus_catalog.json` by default) maps
+  every phase-2 part file to its contiguous global `doc_id` range, plus
+  `total_documents` and the corpus-wide `last_crawled_at` — what the console
+  uses to resolve `doc_id -> text` on demand instead of loading the corpus
+  file whole (`index/corpus_catalog.py`).
+- **The LTR model** (`ltr-model/` by default) is exactly
+  `learning-to-rank-reranker`'s own saved-model directory (`model.txt` +
+  `manifest.json`), published by the `train-reranker` job, unmodified.
 
 ## Programmatic usage
 
@@ -659,11 +769,12 @@ mypy --strict src/
 
 Local backends are tested directly, with no mocks. Real backends are tested
 against faithful doubles of their SDKs: `moto` for S3/MinIO, `fakeredis` for
-Redis Streams, and a real `aiohttp.web` application (served via
-`aiohttp.test_utils.TestServer`) standing in for Consul's HTTP API — chosen
-over the `aioresponses` mocking library after it turned out to be
-incompatible with current `aiohttp` versions (its response-building code
-predates a breaking constructor change in `aiohttp`'s `ClientResponse`).
+Redis Streams (and for phase 6's Redis result cache), and a real
+`aiohttp.web` application (served via `aiohttp.test_utils.TestServer`)
+standing in for Consul's HTTP API — chosen over the `aioresponses` mocking
+library after it turned out to be incompatible with current `aiohttp`
+versions (its response-building code predates a breaking constructor change
+in `aiohttp`'s `ClientResponse`).
 
 Phase 5's query-serving layer is tested at four increasingly real levels (see
 `ARCHITECTURE.md`, phase 5, "Testing this phase" for the full breakdown):
@@ -677,6 +788,15 @@ actual `docker-compose.yml` via the `docker compose` CLI, kills real
 containers, and asserts the coordinator degrades/fails over correctly. It
 skips itself automatically if Docker is not running or if the fixed ports
 `docker-compose.yml` publishes are already bound by another stack.
+
+Phase 6's console is tested end to end without Docker
+(`tests/test_console_app.py`): the real phase-3/5/6 batch pipelines build the
+artifacts, real `distributed-index-sharding` shard servers answer over real
+sockets, and the FastAPI app is driven over ASGI — covering merged + reranked
++ snippeted results, cache hits surviving the whole cluster dying, degraded
+and version-mismatched clusters, and the stats/autocomplete endpoints. See
+`ARCHITECTURE.md`, phase 6, "Testing this phase", for the unit-level suites
+(cache backends, corpus catalog, index version, snippet resolver).
 
 ## Troubleshooting
 
@@ -779,6 +899,31 @@ skips itself automatically if Docker is not running or if the fixed ports
   re-registers itself under a fresh `service_id`/`host` once it passes its
   own health check; give it a few seconds, then re-check Consul's `passing`
   list rather than assuming the old registration comes back.
+- **`console-api` keeps restarting with `ConsoleServingError: no hay ningún
+  objeto bajo ...`:** one of the batch jobs the console needs hasn't run yet
+  against this bucket — the error names which one (`build-index`,
+  `compute-pagerank`, `shard-index` or `train-reranker`); run it and the next
+  `restart: on-failure` retry succeeds.
+- **`shard-index` fails with `no existe 'search-index-compressed/
+  index_version.json'`:** the global index in the bucket was built by a
+  `build-index` older than the version marker — re-run `build-index` (it now
+  always publishes the marker) before `shard-index`.
+- **Every search comes back degraded with `la réplica elegida sirve otra
+  versión del índice`:** the shard replicas restarted onto a newer (or older)
+  build than the one this `console-api` replica loaded at startup — restart
+  the `console-api` replicas after re-running the batch jobs and restarting
+  the shards (see `ARCHITECTURE.md`, phase 6, "Known limitations"). The
+  degradation is the protection working: the alternative would be snippets
+  rendered from the wrong build's documents.
+- **Search works but repeated queries never hit the cache (`console-api`
+  logs `se sirve sin caché`):** Redis is unreachable from the API container
+  (check `BEACON_REDIS_URL` and `docker compose ps redis`), or a shard
+  replica without an announced `index_version` is being chosen (run
+  `shard-index` once with a marker-aware build and restart that replica) —
+  both degrade to serving without cache, never to failing the search.
+- **`OSError: libomp.dylib`/`libgomp.so.1` when importing the CLI:**
+  LightGBM's OpenMP runtime is missing — `brew install libomp` on macOS; the
+  provided `Dockerfile` already installs `libgomp1` on Linux.
 
 ## License
 
