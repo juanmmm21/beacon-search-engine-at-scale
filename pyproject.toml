@@ -20,6 +20,16 @@ dependencies = [
     "index-compression-codec @ git+https://github.com/juanmmm21/index-compression-codec.git@main",
     "pagerank-link-analysis @ git+https://github.com/juanmmm21/pagerank-link-analysis.git@main",
     "distributed-index-sharding @ git+https://github.com/juanmmm21/distributed-index-sharding.git@main",
+    "query-parser-autocomplete @ git+https://github.com/juanmmm21/query-parser-autocomplete.git@main",
+    "learning-to-rank-reranker @ git+https://github.com/juanmmm21/learning-to-rank-reranker.git@main",
+    # La app insignia se reutiliza como dependencia de paquete real (fase 6):
+    # su contrato de API versionado (models.py), la construcción de snippets
+    # (build_snippet) y el lector de stats.json se importan sin modificar --
+    # nunca se reescriben aquí (ver ARCHITECTURE.md, fase 6). El paquete
+    # Python vive en el subdirectorio backend/ de ese repo.
+    "beacon-search-console @ git+https://github.com/juanmmm21/beacon-search-console.git@main#subdirectory=backend",
+    "fastapi>=0.110,<1",
+    "uvicorn[standard]>=0.29,<1",
 ]
 
 [project.scripts]
@@ -34,6 +44,10 @@ dev = [
     "moto[s3]>=5,<6",
     "fakeredis>=2.23,<3",
     "boto3-stubs[s3]>=1.34,<2",
+    # Cliente ASGI para testear la API de la consola (fase 6) sin abrir un
+    # puerto real -- mismo patrón que beacon-search-console usa en su propia
+    # suite de backend.
+    "httpx>=0.27,<1",
 ]
 
 [tool.hatch.build.targets.wheel]
@@ -58,6 +72,13 @@ target-version = "py311"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.ruff.lint.flake8-bugbear]
+# `Depends(...)`/`Query(...)` en valores por defecto es el idioma estándar de
+# FastAPI para inyección de dependencias, no la trampa de "objeto mutable
+# compartido entre llamadas" que B008 existe para detectar -- misma excepción
+# que beacon-search-console ya documenta en su propio pyproject.
+extend-immutable-calls = ["fastapi.Depends", "fastapi.Query"]
 
 [tool.mypy]
 strict = true
@@ -108,4 +129,18 @@ ignore_missing_imports = true
 # distributed-index-sharding tampoco publica un marcador py.typed en su
 # distribución instalada, pese a pasar mypy --strict dentro de su propio repo.
 module = "distributed_index_sharding.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+# Mismo caso que el resto de dependencias del ecosistema arriba: ninguno de
+# los tres paquetes que la fase 6 añade (query-parser-autocomplete,
+# learning-to-rank-reranker y el backend de beacon-search-console) publica un
+# marcador py.typed en su distribución instalada, pese a pasar mypy --strict
+# dentro de su propio repo -- mismo patrón que beacon-search-console ya
+# documenta en su propio pyproject para sus tres dependencias de paquete.
+module = [
+    "query_parser_autocomplete.*",
+    "learning_to_rank_reranker.*",
+    "beacon_search_console.*",
+]
 ignore_missing_imports = true

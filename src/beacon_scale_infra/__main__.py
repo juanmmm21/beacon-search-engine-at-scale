@@ -30,6 +30,12 @@ escalable de un shard descubierta dinámicamente por el registro de servicio
 (`shard-replica`, servicio de larga duración) y lanza una consulta distribuida
 contra los shards que estén vivos en cada momento (`search`) -- ver
 `ARCHITECTURE.md`, fase 5.
+
+Fase 6 (`train-reranker`, `serve-console`): entrena y publica el modelo LTR
+en el almacenamiento de objetos (`train-reranker`, job por lotes) y arranca
+una réplica de la API de la consola sobre el clúster de fase 5
+(`serve-console`, servicio de larga duración, escalable a N réplicas tras un
+balanceador) -- ver `ARCHITECTURE.md`, fase 6.
 """
 
 from __future__ import annotations
@@ -48,12 +54,17 @@ from typing import Any
 
 import aiohttp
 import redis.asyncio as redis_asyncio
+import uvicorn
 from distributed_index_sharding.models import FanOutResult
 from html_content_extractor.models import ExtractionConfig
 from pagerank_link_analysis.models import PageRankParams
 from web_crawler_scheduler.fetcher import AiohttpFetcher
 from web_crawler_scheduler.robots import RobotsCache
 
+from beacon_scale_infra.console.reranker_job import (
+    RerankerTrainingConfig,
+    RerankerTrainingPipeline,
+)
 from beacon_scale_infra.crawl.dedup import InMemorySharedDeduplicator, RedisSharedDeduplicator
 from beacon_scale_infra.crawl.models import CrawlWorkerConfig
 from beacon_scale_infra.crawl.rate_limiter import (
@@ -328,6 +339,32 @@ def _build_parser() -> argparse.ArgumentParser:
     search_parser.add_argument(
         "--parsed-query-file", type=Path, help="JSON de ParsedQuery (query-parser-autocomplete)"
     )
+
+    train_reranker_parser = subparsers.add_parser(
+        "train-reranker",
+        help="Entrena el modelo LTR (learning-to-rank-reranker, dataset sintético "
+        "determinista) y lo sube al almacenamiento de objetos, una única vez, para que "
+        "las réplicas de la consola lo descarguen al arrancar",
+    )
+    train_reranker_parser.add_argument("--storage-backend", choices=["local", "s3"], default="s3")
+    train_reranker_parser.add_argument("--bucket", default="beacon-scale-dev")
+    train_reranker_parser.add_argument("--model-output-prefix", default="ltr-model")
+    train_reranker_parser.add_argument("--num-queries", type=int, default=300)
+    train_reranker_parser.add_argument("--candidates-per-query", type=int, default=25)
+    train_reranker_parser.add_argument("--seed", type=int, default=42)
+    train_reranker_parser.add_argument(
+        "--local-storage-root", type=Path, default=Path(".local-object-storage")
+    )
+
+    serve_console_parser = subparsers.add_parser(
+        "serve-console",
+        help="Arranca una réplica de la API de la consola (fase 6): descarga los "
+        "artefactos del índice, descubre los shards de fase 5 vía el registro de "
+        "servicio y sirve el contrato /api/v1 -- escalable a N réplicas tras un "
+        "balanceador (ver docker-compose.yml, servicios console-api/console-lb)",
+    )
+    serve_console_parser.add_argument("--host", default="127.0.0.1")
+    serve_console_parser.add_argument("--port", type=int, default=8000)
 
     return parser
 
@@ -792,6 +829,44 @@ async def _run_search(args: argparse.Namespace) -> None:
         await registry.aclose()
 
 
+async def _run_train_reranker(args: argparse.Namespace) -> None:
+    config = RerankerTrainingConfig(
+        bucket=args.bucket,
+        model_output_prefix=args.model_output_prefix,
+        num_queries=args.num_queries,
+        candidates_per_query=args.candidates_per_query,
+        seed=args.seed,
+    )
+
+    storage: ObjectStorage
+    if args.storage_backend == "local":
+        storage = LocalFilesystemObjectStorage(args.local_storage_root)
+    else:
+        storage = S3ObjectStorage(
+            endpoint_url=_require_env("BEACON_S3_ENDPOINT_URL"),
+            access_key=_require_env("BEACON_S3_ACCESS_KEY"),
+            secret_key=_require_env("BEACON_S3_SECRET_KEY"),
+            region_name=os.environ.get("BEACON_S3_REGION", "us-east-1"),
+        )
+
+    pipeline = RerankerTrainingPipeline(config, storage=storage)
+    print(
+        f"[train-reranker] arrancando (bucket={args.bucket!r}, "
+        f"model_output_prefix={args.model_output_prefix!r}, seed={args.seed})"
+    )
+    stats = await pipeline.run()
+    print(f"[train-reranker] terminado: {stats}")
+
+    if isinstance(storage, S3ObjectStorage):
+        await storage.aclose()
+
+
+def _run_serve_console(args: argparse.Namespace) -> None:
+    # uvicorn gestiona su propio event loop: este subcomando se despacha en
+    # main() antes de asyncio.run, a diferencia del resto (ver _dispatch).
+    uvicorn.run("beacon_scale_infra.console.app:app", host=args.host, port=args.port)
+
+
 async def _dispatch(args: argparse.Namespace) -> None:
     if args.command == "storage-demo":
         await _run_storage_demo(args)
@@ -813,6 +888,8 @@ async def _dispatch(args: argparse.Namespace) -> None:
         await _run_shard_replica(args)
     elif args.command == "search":
         await _run_search(args)
+    elif args.command == "train-reranker":
+        await _run_train_reranker(args)
     else:  # pragma: no cover - argparse restringe 'command' a los subparsers de arriba
         raise AssertionError(f"comando desconocido: {args.command}")
 
@@ -821,7 +898,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
     try:
-        asyncio.run(_dispatch(args))
+        if args.command == "serve-console":
+            _run_serve_console(args)
+        else:
+            asyncio.run(_dispatch(args))
     except BeaconScaleInfraError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
