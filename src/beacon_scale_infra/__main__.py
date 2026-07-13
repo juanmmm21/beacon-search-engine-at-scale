@@ -23,20 +23,32 @@ Fase 4 (`compute-pagerank`): ejecuta el pipeline de PageRank distribuido una
 única vez (job por lotes, mismo criterio que `build-index` -- ver
 `ARCHITECTURE.md`, fase 4, sección 0), después de que `build-index` haya
 dejado `search-index/documents.jsonl` listo.
+
+Fase 5 (`shard-index`, `shard-replica`, `search`): particiona el índice
+global de fase 3 en shards (`shard-index`, job por lotes), sirve una réplica
+escalable de un shard descubierta dinámicamente por el registro de servicio
+(`shard-replica`, servicio de larga duración) y lanza una consulta distribuida
+contra los shards que estén vivos en cada momento (`search`) -- ver
+`ARCHITECTURE.md`, fase 5.
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
+import json
 import os
+import signal
 import socket
 import sys
 from collections.abc import Sequence
 from pathlib import Path
+from typing import Any
 
 import aiohttp
 import redis.asyncio as redis_asyncio
+from distributed_index_sharding.models import FanOutResult
 from html_content_extractor.models import ExtractionConfig
 from pagerank_link_analysis.models import PageRankParams
 from web_crawler_scheduler.fetcher import AiohttpFetcher
@@ -59,6 +71,10 @@ from beacon_scale_infra.models import ServiceInstance
 from beacon_scale_infra.pagerank.models import PageRankPipelineConfig
 from beacon_scale_infra.pagerank.pipeline import DistributedPageRankPipeline
 from beacon_scale_infra.protocols import MessageQueue, ObjectStorage, ServiceRegistry
+from beacon_scale_infra.query.models import ShardIndexPipelineConfig, ShardReplicaConfig
+from beacon_scale_infra.query.pipeline import DistributedQueryServingPipeline
+from beacon_scale_infra.query.shard_index_pipeline import ShardIndexPipeline
+from beacon_scale_infra.query.shard_replica_service import ShardReplicaService
 from beacon_scale_infra.queue.memory import InMemoryMessageQueue
 from beacon_scale_infra.queue.redis_streams import RedisStreamsMessageQueue
 from beacon_scale_infra.registry.consul import ConsulServiceRegistry
@@ -241,6 +257,76 @@ def _build_parser() -> argparse.ArgumentParser:
     compute_pagerank_parser.add_argument("--max-iterations", type=int, default=100)
     compute_pagerank_parser.add_argument(
         "--local-storage-root", type=Path, default=Path(".local-object-storage")
+    )
+
+    shard_index_parser = subparsers.add_parser(
+        "shard-index",
+        help="Particiona el índice global de fase 3 en N shards y los sube al almacenamiento "
+        "de objetos, una única vez, para que las réplicas de 'shard-replica' los descarguen",
+    )
+    shard_index_parser.add_argument("--storage-backend", choices=["local", "s3"], default="s3")
+    shard_index_parser.add_argument("--bucket", default="beacon-scale-dev")
+    shard_index_parser.add_argument(
+        "--source-index-prefix",
+        default="search-index-compressed",
+        help="Prefijo del índice global de fase 3 -- 'search-index-compressed' si 'build-index' "
+        "comprimió (por defecto), o 'search-index' si se corrió con --no-compress",
+    )
+    shard_index_parser.add_argument("--shard-index-prefix", default="shard-index")
+    shard_index_parser.add_argument("--num-shards", type=int, default=3)
+    shard_index_parser.add_argument(
+        "--local-storage-root", type=Path, default=Path(".local-object-storage")
+    )
+
+    shard_replica_parser = subparsers.add_parser(
+        "shard-replica",
+        help="Arranca una réplica escalable de un shard: descarga su partición, sirve "
+        "'distributed-index-sharding serve-shard' y se anuncia en el registro de servicio",
+    )
+    shard_replica_parser.add_argument("--shard-id", type=int, required=True)
+    shard_replica_parser.add_argument(
+        "--replica-id",
+        default=None,
+        help="Identificador de esta réplica dentro de su shard_id (por defecto, el hostname del "
+        "contenedor -- distinto por réplica bajo 'docker compose up --scale')",
+    )
+    shard_replica_parser.add_argument("--storage-backend", choices=["local", "s3"], default="s3")
+    shard_replica_parser.add_argument("--bucket", default="beacon-scale-dev")
+    shard_replica_parser.add_argument("--shard-index-prefix", default="shard-index")
+    shard_replica_parser.add_argument(
+        "--registry-backend", choices=["local", "consul"], default="consul"
+    )
+    shard_replica_parser.add_argument("--service-name", default="beacon-scale-shard")
+    shard_replica_parser.add_argument(
+        "--host", default="0.0.0.0", help="Dirección de bind del servidor HTTP del shard"
+    )
+    shard_replica_parser.add_argument("--port", type=int, default=9300)
+    shard_replica_parser.add_argument(
+        "--announce-host",
+        default=None,
+        help="Dirección con la que esta réplica se anuncia en el registro de servicio (por "
+        "defecto, el hostname del contenedor -- resoluble por los demás contenedores de la "
+        "misma red de 'docker-compose.yml')",
+    )
+    shard_replica_parser.add_argument("--ttl-seconds", type=float, default=15.0)
+    shard_replica_parser.add_argument("--heartbeat-interval-seconds", type=float, default=5.0)
+    shard_replica_parser.add_argument("--health-check-timeout-seconds", type=float, default=30.0)
+    shard_replica_parser.add_argument(
+        "--local-storage-root", type=Path, default=Path(".local-object-storage")
+    )
+
+    search_parser = subparsers.add_parser(
+        "search",
+        help="Lanza una consulta distribuida contra los shards vivos en este momento, "
+        "descubiertos vía el registro de servicio (no una lista fija de --shard)",
+    )
+    search_parser.add_argument("--registry-backend", choices=["local", "consul"], default="consul")
+    search_parser.add_argument("--service-name", default="beacon-scale-shard")
+    search_parser.add_argument("--top-k", type=int, default=10)
+    search_parser.add_argument("--timeout-seconds", type=float, default=2.0)
+    search_parser.add_argument("--text", help="Query en crudo, sin operadores")
+    search_parser.add_argument(
+        "--parsed-query-file", type=Path, help="JSON de ParsedQuery (query-parser-autocomplete)"
     )
 
     return parser
@@ -570,6 +656,142 @@ async def _run_compute_pagerank(args: argparse.Namespace) -> None:
         await storage.aclose()
 
 
+async def _run_shard_index(args: argparse.Namespace) -> None:
+    config = ShardIndexPipelineConfig(
+        bucket=args.bucket,
+        source_index_prefix=args.source_index_prefix,
+        shard_index_prefix=args.shard_index_prefix,
+        num_shards=args.num_shards,
+    )
+
+    storage: ObjectStorage
+    if args.storage_backend == "local":
+        storage = LocalFilesystemObjectStorage(args.local_storage_root)
+    else:
+        storage = S3ObjectStorage(
+            endpoint_url=_require_env("BEACON_S3_ENDPOINT_URL"),
+            access_key=_require_env("BEACON_S3_ACCESS_KEY"),
+            secret_key=_require_env("BEACON_S3_SECRET_KEY"),
+            region_name=os.environ.get("BEACON_S3_REGION", "us-east-1"),
+        )
+
+    pipeline = ShardIndexPipeline(config, storage=storage)
+    print(
+        f"[shard-index] arrancando (bucket={args.bucket!r}, "
+        f"source_index_prefix={args.source_index_prefix!r}, num_shards={args.num_shards})"
+    )
+    stats = await pipeline.run()
+    print(f"[shard-index] terminado: {stats}")
+
+    if isinstance(storage, S3ObjectStorage):
+        await storage.aclose()
+
+
+async def _run_shard_replica(args: argparse.Namespace) -> None:
+    replica_id = args.replica_id or socket.gethostname()
+    config = ShardReplicaConfig(
+        shard_id=args.shard_id,
+        replica_id=replica_id,
+        bucket=args.bucket,
+        shard_index_prefix=args.shard_index_prefix,
+        service_name=args.service_name,
+        host=args.host,
+        port=args.port,
+        announce_host=args.announce_host,
+        ttl_seconds=args.ttl_seconds,
+        heartbeat_interval_seconds=args.heartbeat_interval_seconds,
+        health_check_timeout_seconds=args.health_check_timeout_seconds,
+    )
+
+    storage: ObjectStorage
+    if args.storage_backend == "local":
+        storage = LocalFilesystemObjectStorage(args.local_storage_root)
+    else:
+        storage = S3ObjectStorage(
+            endpoint_url=_require_env("BEACON_S3_ENDPOINT_URL"),
+            access_key=_require_env("BEACON_S3_ACCESS_KEY"),
+            secret_key=_require_env("BEACON_S3_SECRET_KEY"),
+            region_name=os.environ.get("BEACON_S3_REGION", "us-east-1"),
+        )
+
+    registry: ServiceRegistry
+    if args.registry_backend == "local":
+        registry = InMemoryServiceRegistry()
+    else:
+        registry = ConsulServiceRegistry(
+            base_url=os.environ.get("BEACON_CONSUL_BASE_URL", "http://localhost:8500")
+        )
+
+    shutdown_event = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    # SIGTERM es lo que 'docker stop'/'docker compose down' envía: sin un
+    # manejador propio, Python lo trata como terminación inmediata y esta
+    # réplica nunca llegaría a desregistrarse (ver shard_replica_service.py,
+    # sección sobre apagado con aviso vs. sin aviso). add_signal_handler no
+    # existe en Windows, pero este binario solo corre en contenedores Linux.
+    with contextlib.suppress(NotImplementedError):
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            loop.add_signal_handler(sig, shutdown_event.set)
+
+    print(f"[shard-replica:{config.shard_id}:{replica_id}] arrancando")
+    service = await ShardReplicaService.start(config, storage=storage, registry=registry)
+    try:
+        await shutdown_event.wait()
+    finally:
+        print(f"[shard-replica:{config.shard_id}:{replica_id}] deteniendo")
+        await service.shutdown()
+
+    if isinstance(storage, S3ObjectStorage):
+        await storage.aclose()
+    if isinstance(registry, ConsulServiceRegistry):
+        await registry.aclose()
+
+
+def _print_fan_out_result(result: FanOutResult) -> None:
+    for outcome in result.outcomes:
+        status_note = "" if outcome.status == "ok" else f" ({outcome.error_message})"
+        print(
+            f"  shard {outcome.shard_id}: {outcome.status}{status_note} "
+            f"[{outcome.latency_ms:.1f} ms, {len(outcome.hits)} hits]",
+            file=sys.stderr,
+        )
+    if not result.merged:
+        print("Sin resultados")
+        return
+    for position, hit in enumerate(result.merged, start=1):
+        print(f"{position}. doc_id={hit.doc_id} score={hit.score:.4f}")
+
+
+async def _run_search(args: argparse.Namespace) -> None:
+    if bool(args.text) == bool(args.parsed_query_file):
+        raise SystemExit("pasa exactamente uno de --text o --parsed-query-file")
+
+    registry: ServiceRegistry
+    if args.registry_backend == "local":
+        registry = InMemoryServiceRegistry()
+    else:
+        registry = ConsulServiceRegistry(
+            base_url=os.environ.get("BEACON_CONSUL_BASE_URL", "http://localhost:8500")
+        )
+
+    async with DistributedQueryServingPipeline(
+        registry, service_name=args.service_name, timeout_seconds=args.timeout_seconds
+    ) as pipeline:
+        if args.text:
+            result = await pipeline.search_text(args.text, top_k=args.top_k)
+        else:
+            parsed_query_file: Path = args.parsed_query_file
+            if not parsed_query_file.exists():
+                raise SystemExit(f"no existe parsed_query_file={parsed_query_file}")
+            parsed_query: dict[str, Any] = json.loads(parsed_query_file.read_text(encoding="utf-8"))
+            result = await pipeline.search_parsed_query(parsed_query, top_k=args.top_k)
+
+    _print_fan_out_result(result)
+
+    if isinstance(registry, ConsulServiceRegistry):
+        await registry.aclose()
+
+
 async def _dispatch(args: argparse.Namespace) -> None:
     if args.command == "storage-demo":
         await _run_storage_demo(args)
@@ -585,6 +807,12 @@ async def _dispatch(args: argparse.Namespace) -> None:
         await _run_build_index(args)
     elif args.command == "compute-pagerank":
         await _run_compute_pagerank(args)
+    elif args.command == "shard-index":
+        await _run_shard_index(args)
+    elif args.command == "shard-replica":
+        await _run_shard_replica(args)
+    elif args.command == "search":
+        await _run_search(args)
     else:  # pragma: no cover - argparse restringe 'command' a los subparsers de arriba
         raise AssertionError(f"comando desconocido: {args.command}")
 
