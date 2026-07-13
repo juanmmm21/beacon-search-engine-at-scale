@@ -3,17 +3,37 @@
 # Levanta los tres servicios de sustrato decididos en ARCHITECTURE.md
 # (almacenamiento de objetos, cola de mensajes, registro de servicio), un
 # contenedor de arranque que crea el bucket de desarrollo, el servicio
-# 'crawl-worker' de la fase 1 (crawl distribuido) y el servicio
-# 'extract-worker' de la fase 2 (extracción distribuida) -- nunca las 10
-# piezas de dominio de beacon-search-engine, que no viven aquí (ver
-# ARCHITECTURE.md, sección "Por qué los diez repos originales no se tocan").
+# 'crawl-worker' de la fase 1 (crawl distribuido), el servicio
+# 'extract-worker' de la fase 2 (extracción distribuida) y los servicios
+# 'shard-0'/'shard-1'/'shard-2' de la fase 5 (query serving distribuido) --
+# nunca las 10 piezas de dominio de beacon-search-engine, que no viven aquí
+# (ver ARCHITECTURE.md, sección "Por qué los diez repos originales no se
+# tocan").
+#
+# A diferencia de 'crawl-worker'/'extract-worker', los shards NO son
+# intercambiables entre sí -- cada uno sirve una partición distinta del
+# índice (ver ARCHITECTURE.md, fase 5), así que no hay un único servicio
+# 'shard' escalable con '--scale shard=N': cada shard_id es su propio
+# servicio Compose (mismo patrón que Kubernetes necesitaría un Deployment por
+# shard_id, ver ARCHITECTURE.md, fase 5, sección "Evolución a Kubernetes"),
+# cada uno independientemente escalable a varias réplicas para tolerar la
+# caída de una sin perder esa partición.
+#
+# 'build-index' (fase 3), 'compute-pagerank' (fase 4) y 'shard-index' (fase
+# 5, particiona el índice global en shards) son jobs por lotes de un solo
+# disparo, no servicios de este fichero -- se invocan a mano desde el host
+# contra esta misma infraestructura (ver README.md, "Uso (CLI)").
 #
 # Uso:
-#   docker compose up -d
+#   docker compose up -d                               # sustrato + workers
 #   docker compose up -d --scale crawl-worker=4 --scale extract-worker=4
 #   docker compose exec -it <servicio> ...   # inspección puntual
 #   docker compose logs -f crawl-worker            # ver qué worker crawlea qué URL
 #   docker compose logs -f extract-worker            # ver qué worker extrae qué página
+#   # Tras build-index + shard-index (ver README.md):
+#   docker compose up -d shard-0 shard-1 shard-2
+#   docker compose up -d --scale shard-0=2          # 2 réplicas del shard 0
+#   docker compose kill beacon-search-engine-at-scale-shard-0-1   # matar 1 réplica de verdad
 #   docker compose down -v                     # borra también los volúmenes de datos
 
 services:
@@ -140,6 +160,109 @@ services:
     # publica en 'beacon-scale-extract-frontier' (ver crawl/worker.py,
     # _write_page). Mismo criterio de apagado que crawl-worker: se detiene
     # solo cuando esa cola lleva varios sondeos vacía.
+    restart: on-failure
+
+  # --- Fase 5: réplicas de shard (query serving distribuido) --------------
+  #
+  # Cada servicio 'shard-N' descarga su partición del índice (subida por el
+  # job 'shard-index', ver README.md) y arranca una réplica de
+  # 'beacon-scale-infra shard-replica' -- que a su vez lanza
+  # 'distributed-index-sharding serve-shard' como subproceso real y se
+  # anuncia en Consul con 'shard_id' en su metadata (ver
+  # query/shard_replica_service.py). Ningún puerto se publica al host: estos
+  # servicios solo se hablan entre sí (coordinador <-> shard) dentro de la
+  # red 'beacon-scale', descubiertos dinámicamente vía Consul, nunca por un
+  # puerto fijo de localhost -- ver ARCHITECTURE.md, fase 5.
+  #
+  # Todas las réplicas de un mismo servicio comparten '--shard-id' pero cada
+  # contenedor recibe un hostname corto de Docker distinto (igual que
+  # crawl-worker/extract-worker, ver más arriba), que 'shard-replica' usa por
+  # defecto tanto como '--replica-id' como para anunciarse en Consul
+  # ('--announce-host'), así que 'docker compose up -d --scale shard-0=2' da
+  # dos réplicas vivas del shard 0 sin ninguna configuración por réplica.
+  shard-0:
+    build: .
+    depends_on:
+      minio-init:
+        condition: service_completed_successfully
+      consul:
+        condition: service_healthy
+    environment:
+      BEACON_S3_ENDPOINT_URL: http://minio:9000
+      BEACON_S3_ACCESS_KEY: beacon-dev
+      BEACON_S3_SECRET_KEY: beacon-dev-secret
+      BEACON_CONSUL_BASE_URL: http://consul:8500
+    command:
+      - shard-replica
+      - --shard-id
+      - "0"
+      - --storage-backend
+      - s3
+      - --registry-backend
+      - consul
+      - --host
+      - 0.0.0.0
+      - --port
+      - "9300"
+    networks: [beacon-scale]
+    # A diferencia de crawl-worker/extract-worker, un shard nunca "termina":
+    # sirve consultas indefinidamente, así que un reinicio siempre implica un
+    # fallo real (proceso caído, o el job 'shard-index' aún no ha corrido
+    # para este shard_id -- ver query/shard_index_pipeline.py).
+    restart: on-failure
+
+  shard-1:
+    build: .
+    depends_on:
+      minio-init:
+        condition: service_completed_successfully
+      consul:
+        condition: service_healthy
+    environment:
+      BEACON_S3_ENDPOINT_URL: http://minio:9000
+      BEACON_S3_ACCESS_KEY: beacon-dev
+      BEACON_S3_SECRET_KEY: beacon-dev-secret
+      BEACON_CONSUL_BASE_URL: http://consul:8500
+    command:
+      - shard-replica
+      - --shard-id
+      - "1"
+      - --storage-backend
+      - s3
+      - --registry-backend
+      - consul
+      - --host
+      - 0.0.0.0
+      - --port
+      - "9300"
+    networks: [beacon-scale]
+    restart: on-failure
+
+  shard-2:
+    build: .
+    depends_on:
+      minio-init:
+        condition: service_completed_successfully
+      consul:
+        condition: service_healthy
+    environment:
+      BEACON_S3_ENDPOINT_URL: http://minio:9000
+      BEACON_S3_ACCESS_KEY: beacon-dev
+      BEACON_S3_SECRET_KEY: beacon-dev-secret
+      BEACON_CONSUL_BASE_URL: http://consul:8500
+    command:
+      - shard-replica
+      - --shard-id
+      - "2"
+      - --storage-backend
+      - s3
+      - --registry-backend
+      - consul
+      - --host
+      - 0.0.0.0
+      - --port
+      - "9300"
+    networks: [beacon-scale]
     restart: on-failure
 
 networks:
