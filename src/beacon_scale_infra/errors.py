@@ -73,3 +73,21 @@ class QueryServingError(BeaconScaleInfraError):
     ni con un `ShardOutcome` degradado de `distributed-index-sharding` (que
     es tolerancia a fallo esperada, no un error de esta capa; ver
     `ARCHITECTURE.md`, fase 5)."""
+
+
+class CacheError(BeaconScaleInfraError):
+    """Fallo al leer o escribir una entrada de la caché compartida (fase 6):
+    conexión Redis rechazada, timeout, o un fallo del backend -- nunca se deja
+    escapar la excepción cruda del SDK de Redis sin envolver. La capa de
+    consola trata este error como degradación (sirve la búsqueda sin caché,
+    registrándolo), nunca como fallo de la búsqueda misma (ver
+    `ARCHITECTURE.md`, fase 6)."""
+
+
+class ConsoleServingError(BeaconScaleInfraError):
+    """Fallo de la capa de orquestación de la consola (fase 6): artefactos
+    del índice ausentes o incompletos en el almacenamiento de objetos (¿han
+    corrido 'build-index'/'shard-index'/'train-reranker'?), o un marcador de
+    versión de índice ilegible -- nunca confundido con la degradación por
+    shard caído, que es tolerancia a fallo esperada y viaja como datos en la
+    respuesta de la API (`degraded`/`shard_statuses`), no como excepción."""

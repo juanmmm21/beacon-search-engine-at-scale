@@ -1,5 +1,5 @@
 """Interfaces del sustrato compartido: almacenamiento de objetos, cola de
-mensajes y registro de servicio.
+mensajes, registro de servicio y caché compartida.
 
 Cada protocolo desacopla la lógica que lo consume (futuras fases de crawl e
 indexación distribuidos) de qué backend concreto hay detrás — el mismo
@@ -118,4 +118,31 @@ class ServiceRegistry(Protocol):
         """Devuelve solo las instancias vivas (TTL no expirado) de
         `service_name`, en cualquier orden — el llamador decide la
         estrategia de balanceo/fan-out."""
+        ...
+
+
+@runtime_checkable
+class CacheStore(Protocol):
+    """Caché compartida de pares clave/valor con expiración (resultados de
+    búsqueda de la consola, fase 6): varias réplicas de la API leen y
+    escriben las mismas entradas, en vez de mantener cada una una caché en
+    memoria de proceso que divergería entre réplicas (ver `ARCHITECTURE.md`,
+    fase 6).
+
+    Deliberadamente no hay operación de borrado masivo/por prefijo: la
+    invalidación se hace por *namespace de versión de índice en la clave*
+    (una versión nueva nunca lee claves de la anterior) más expiración por
+    TTL de las entradas huérfanas -- nunca un `SCAN`+`DEL` sobre el keyspace
+    completo (ver `ARCHITECTURE.md`, fase 6, decisión de invalidación)."""
+
+    async def get(self, key: str) -> str | None:
+        """Devuelve el valor de `key`, o `None` si no existe o su TTL expiró.
+        Levanta `CacheError` ante un fallo del backend (nunca lo confunde con
+        una ausencia)."""
+        ...
+
+    async def set(self, key: str, value: str, *, ttl_seconds: float) -> None:
+        """Escribe (o sobrescribe) `key` con expiración obligatoria: una
+        entrada sin TTL sobreviviría para siempre a la versión del índice que
+        la produjo. Levanta `CacheError` ante un fallo del backend."""
         ...
