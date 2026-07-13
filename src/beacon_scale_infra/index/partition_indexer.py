@@ -20,27 +20,9 @@ from pathlib import Path
 from inverted_index_builder.models import DocumentRecord, InvertedIndex, Posting, PostingsList
 from inverted_index_builder.pipeline import IndexBuilder
 
-from beacon_scale_infra.errors import IndexingError, ObjectStorageError
+from beacon_scale_infra.errors import IndexingError
+from beacon_scale_infra.index.corpus_catalog import materialize_partition_with_parts
 from beacon_scale_infra.protocols import ObjectStorage
-
-_DOCUMENT_PART_PREFIX = "documents-"
-
-
-async def _list_document_part_keys(
-    storage: ObjectStorage, bucket: str, prefix: str, partition_key: str
-) -> list[str]:
-    partition_prefix = f"{prefix}/partition={partition_key}/{_DOCUMENT_PART_PREFIX}"
-    keys = [
-        object_metadata.key
-        async for object_metadata in storage.list_objects(bucket, prefix=partition_prefix)
-    ]
-    # El padding a ancho fijo de `part_seq` (`extract/partitioning.py`,
-    # `documents-NNNNNN.jsonl`) hace que el orden lexicográfico de texto
-    # coincida con el orden numérico ascendente -- el mismo orden en que
-    # `ExtractWorker._flush` los escribió, y el que este módulo necesita
-    # preservar para que `local_doc_id` (posición de línea en la
-    # concatenación) sea determinista.
-    return sorted(keys)
 
 
 async def materialize_partition_documents(
@@ -57,17 +39,17 @@ async def materialize_partition_documents(
     fichero). Devuelve el número de ficheros de parte concatenados, para que
     el llamador pueda distinguir una partición vacía (`0`) de un fallo de
     lectura silencioso.
+
+    Delegado en `corpus_catalog.materialize_partition_with_parts` (fase 6
+    necesita además el desglose de rangos de `doc_id` por fichero de parte y
+    el `fetched_at` máximo; este envoltorio conserva la firma original para
+    quien solo necesita materializar) -- una única implementación del bucle
+    de descarga, nunca dos copias que mantener sincronizadas.
     """
-    try:
-        part_keys = await _list_document_part_keys(storage, bucket, prefix, partition_key)
-        with destination.open("wb") as destination_file:
-            for part_key in part_keys:
-                destination_file.write(await storage.get_object(bucket, part_key))
-    except (OSError, ObjectStorageError) as exc:
-        raise IndexingError(
-            f"fallo al materializar la partición {partition_key!r} en {destination}: {exc}"
-        ) from exc
-    return len(part_keys)
+    materialization = await materialize_partition_with_parts(
+        storage, bucket, prefix, partition_key, destination, start_doc_id=0
+    )
+    return len(materialization.parts)
 
 
 def _remap_document(record: DocumentRecord, offset: int) -> DocumentRecord:

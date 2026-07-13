@@ -21,6 +21,7 @@ class IndexingPipelineConfig:
     extract_prefix: str = "extracted-documents"
     index_output_prefix: str = "search-index"
     corpus_object_key: str = "search-index/corpus/documents.jsonl"
+    corpus_catalog_object_key: str = "search-index/corpus_catalog.json"
     compress: bool = True
     compressed_output_prefix: str = "search-index-compressed"
 
@@ -33,6 +34,8 @@ class IndexingPipelineConfig:
             raise ValueError("index_output_prefix no puede estar vacío")
         if not self.corpus_object_key:
             raise ValueError("corpus_object_key no puede estar vacío")
+        if not self.corpus_catalog_object_key:
+            raise ValueError("corpus_catalog_object_key no puede estar vacío")
         if not self.compressed_output_prefix:
             raise ValueError("compressed_output_prefix no puede estar vacío")
 
@@ -46,3 +49,4 @@ class IndexingRunStats:
     vocabulary_size: int
     total_postings: int
     compression_ratio: float | None
+    index_version: str
