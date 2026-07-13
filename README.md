@@ -29,20 +29,30 @@ and, after measuring the real memory/time cost of the reused algorithm at
 this project's target scale, runs it on a single process rather than
 building a distributed power-iteration engine the corpus does not need (see
 [`ARCHITECTURE.md`](ARCHITECTURE.md), "Phase 4 — PageRank", for the
-measurements). See [`ARCHITECTURE.md`](ARCHITECTURE.md) for the full
-reasoning behind every decision across all four phases, the alternatives
-considered, and how each piece of phase 0 is meant to evolve toward
-Kubernetes.
+measurements). Phase 5, the last phase before the flagship app, serves
+queries against phase 3's index over real, independently restartable
+infrastructure: `distributed-index-sharding`'s own partitioning, shard HTTP
+server, async fan-out and merge run unmodified, discovered dynamically
+through the phase-0 service registry instead of a fixed list of shard
+addresses, so that redundant replicas of the same shard fail over into each
+other without the caller ever holding a stale target list (see
+[`ARCHITECTURE.md`](ARCHITECTURE.md), "Phase 5 — Distributed query serving").
+See [`ARCHITECTURE.md`](ARCHITECTURE.md) for the full reasoning behind every
+decision across all five phases, the alternatives considered, and how each
+piece of phase 0 is meant to evolve toward Kubernetes.
 
-This repo does not implement a query server, and it does not modify any of
-the ten existing `beacon-search-engine` repositories — `web-crawler-scheduler`'s
-own crawler logic (see "Distributed crawling (phase 1)" below),
-`html-content-extractor`'s own extraction logic (see "Distributed extraction
-(phase 2)" below), `inverted-index-builder`'s / `index-compression-codec`'s
-own indexing and compression logic (see "Distributed indexing (phase 3)"
-below), and `pagerank-link-analysis`'s own ranking algorithm (see "PageRank
-(phase 4)" below) are all reused as real package dependencies, unchanged. It
-is a sibling repository that later phases extend.
+This repo does not implement a query server of its own (see "Distributed
+query serving (phase 5)" below for exactly what it does instead), and it does
+not modify any of the ten existing `beacon-search-engine` repositories —
+`web-crawler-scheduler`'s own crawler logic (see "Distributed crawling (phase
+1)" below), `html-content-extractor`'s own extraction logic (see "Distributed
+extraction (phase 2)" below), `inverted-index-builder`'s /
+`index-compression-codec`'s own indexing and compression logic (see
+"Distributed indexing (phase 3)" below), `pagerank-link-analysis`'s own
+ranking algorithm (see "PageRank (phase 4)" below), and
+`distributed-index-sharding`'s own partitioning/fan-out/merge (see
+"Distributed query serving (phase 5)" below) are all reused as real package
+dependencies, unchanged. It is a sibling repository that later phases extend.
 
 ## Role in `beacon-search-engine`
 
@@ -185,6 +195,7 @@ short:
 | Message queue | `InMemoryMessageQueue` | `RedisStreamsMessageQueue` |
 | Service registry | `InMemoryServiceRegistry` | `ConsulServiceRegistry` |
 | Orchestration | `docker-compose.yml` | Kubernetes (`Deployment`/`StatefulSet` per service — documented, not implemented here) |
+| Shard discovery (phase 5) | fixed `ShardTarget` list into `SearchCoordinator` | `resolve_shard_targets` over `ServiceRegistry.discover`, re-resolved before every query |
 
 ## Distributed crawling (phase 1)
 
@@ -400,6 +411,80 @@ materializing the link graph from a large `crawl-pages/`. Without Docker,
 point `--storage-backend local --local-storage-root` at the same directory
 `build-index --storage-backend local` wrote to.
 
+## Distributed query serving (phase 5)
+
+`src/beacon_scale_infra/query/` answers a search query by fanning it out to
+every shard of the index phase 3 built and merging the already-ranked
+results — over real, independently restartable containers instead of local
+subprocesses. `distributed-index-sharding`'s own partitioning, shard HTTP
+server, async fan-out and k-way merge run **unmodified**; this phase adds
+only what running shards as real, horizontally-scaled infrastructure needs
+and that project explicitly leaves to its caller (see its own README,
+"Adding or removing a shard without downtime"): discovering shard addresses
+dynamically instead of taking a fixed list, and failing over between
+redundant replicas of the same shard. See
+[`ARCHITECTURE.md`](ARCHITECTURE.md), section "Phase 5 — Distributed query
+serving", for the full reasoning.
+
+| Concern | `distributed-index-sharding` alone | This phase |
+|---|---|---|
+| Shard addresses | fixed `ShardTarget(shard_id, host, port)` list, typed by hand or from `LocalShardCluster` | discovered dynamically via `resolve_shard_targets` over the phase-0 `ServiceRegistry`, re-resolved before every query |
+| Replicas of the same shard | not modeled — a caller passing two targets for one `shard_id` gets duplicated results | exactly one target per `shard_id`, deterministic tie-break among live replicas, real failover when the chosen one stops being alive |
+| Running a shard | `serve-shard`, launched as a subprocess by `LocalShardCluster` | the same `serve-shard` subprocess, wrapped by `ShardReplicaService`: downloads its shard from `ObjectStorage`, registers in `ServiceRegistry`, heartbeats its TTL |
+| Partitioning the index | `partition_index`, run by hand against a local directory | the same function, unmodified, run by the `shard-index` batch job against phase 3's `ObjectStorage` output, with results uploaded back per-shard |
+| Fan-out, merge | `SearchCoordinator` + `merge_shard_outcomes` | the exact same classes, given a dynamically-resolved target list instead of a fixed one |
+
+Shard replicas are **not** interchangeable the way `crawl-worker`/
+`extract-worker` are: each one owns a disjoint partition of `doc_id`s, so
+`docker-compose.yml` defines one service per `shard_id` (`shard-0`,
+`shard-1`, `shard-2`), each independently scalable to add redundancy —
+`--scale shard-0=2` gives shard 0 two live replicas, not two different
+shards.
+
+### Running it
+
+```bash
+docker compose up -d                    # MinIO, Redis, Consul, bucket bootstrap
+python -m beacon_scale_infra build-index --storage-backend s3 --bucket beacon-scale-dev
+
+# Partition the global index into shards (one-shot, like build-index)
+BEACON_S3_ENDPOINT_URL=http://localhost:9000 \
+BEACON_S3_ACCESS_KEY=beacon-dev \
+BEACON_S3_SECRET_KEY=beacon-dev-secret \
+python -m beacon_scale_infra shard-index --storage-backend s3 --bucket beacon-scale-dev --num-shards 3
+
+# Bring up shard replicas -- 2 for shard 0, 1 each for shards 1 and 2
+docker compose up -d --scale shard-0=2 shard-0 shard-1 shard-2
+
+# Query the shards that are alive right now
+BEACON_CONSUL_BASE_URL=http://localhost:8500 \
+python -m beacon_scale_infra search --registry-backend consul --text "python" --top-k 5
+```
+
+To see failover in practice, kill one of the two `shard-0` containers and
+run `search` again — the query still returns shard 0's documents through its
+surviving replica:
+
+```bash
+docker compose ps shard-0
+docker kill <one-of-the-two-shard-0-container-ids>
+python -m beacon_scale_infra search --registry-backend consul --text "python" --top-k 5
+```
+
+### Running a single replica without Docker
+
+```bash
+python -m beacon_scale_infra shard-replica \
+  --shard-id 0 --storage-backend local --registry-backend local \
+  --host 127.0.0.1 --port 9300 --announce-host 127.0.0.1 \
+  --local-storage-root .local-object-storage
+```
+
+Same caveat as every other `--storage-backend local`/`--registry-backend
+local` invocation: neither backend coordinates across separate process
+invocations, so this only makes sense to smoke-test one replica in isolation,
+never to simulate a multi-replica cluster.
+
 ## Requirements and installation
 
 - Python `>=3.11`
@@ -431,9 +516,10 @@ Git URLs (see `pyproject.toml`).
 
 This section covers the phase-0 substrate demo commands
 (`storage-demo`/`queue-demo`/`registry-demo`); see "Distributed crawling
-(phase 1)" above for `crawl-worker` and "Distributed extraction (phase 2)"
-above for `extract-worker`. A demonstration CLI exercises each piece of the
-substrate end to end, against either backend:
+(phase 1)" above for `crawl-worker`, "Distributed extraction (phase 2)"
+above for `extract-worker`, and "Distributed query serving (phase 5)" above
+for `shard-index`/`shard-replica`/`search`. A demonstration CLI exercises
+each piece of the substrate end to end, against either backend:
 
 ```bash
 # Local backends, no Docker required
@@ -488,6 +574,16 @@ object, message, or service instance, and prints every step.
   `pagerank-link-analysis`'s own on-disk format (`manifest.json`,
   `pagerank_scores.jsonl` — `doc_id -> pagerank_score`, sorted ascending —
   and `convergence.json`), unmodified — see "PageRank (phase 4)" above.
+- **Sharded index directories** (`shard-index/shard-<id>/` by default) are
+  exactly `distributed-index-sharding`'s own `partition_index` output — an
+  uncompressed `inverted-index-builder`-format directory per shard, plus one
+  `shard-index/cluster_manifest.json` (`{"num_shards": ..., "shard_dir_names":
+  [...]}`) describing them — unmodified, see that repo's own README for the
+  field-by-field contract.
+- **A shard replica's service instance metadata** carries exactly one key,
+  `{"shard_id": "<int>"}` — the convention `resolve_shard_targets`
+  (`query/shard_discovery.py`) depends on to group live replicas by which
+  partition they serve; see `ARCHITECTURE.md`, phase 5, section 0.
 
 ## Programmatic usage
 
@@ -520,6 +616,38 @@ Swap `LocalFilesystemObjectStorage`/`InMemoryServiceRegistry` for
 `MessageQueue`) to run the exact same calling code against real
 infrastructure — no other code changes.
 
+Querying dynamically-discovered shards (phase 5) follows the same shape:
+
+```python
+import asyncio
+
+from beacon_scale_infra.query.pipeline import DistributedQueryServingPipeline
+from beacon_scale_infra.registry.consul import ConsulServiceRegistry
+
+
+async def main() -> None:
+    registry = ConsulServiceRegistry(base_url="http://localhost:8500")
+    try:
+        async with DistributedQueryServingPipeline(
+            registry, service_name="beacon-scale-shard"
+        ) as pipeline:
+            result = await pipeline.search_text("python", top_k=10)
+            for hit in result.merged:
+                print(hit.doc_id, hit.score)
+            if result.failed_shard_ids:
+                print("degraded, missing shards:", result.failed_shard_ids)
+    finally:
+        await registry.aclose()
+
+
+asyncio.run(main())
+```
+
+Every call to `search_text`/`search_parsed_query` re-resolves which
+`ShardTarget` to fan out to from whatever `registry.discover(...)` reports as
+alive *at that moment* — there is no fixed list to keep in sync as replicas
+come and go.
+
 ## Development
 
 ```bash
@@ -536,6 +664,19 @@ Redis Streams, and a real `aiohttp.web` application (served via
 over the `aioresponses` mocking library after it turned out to be
 incompatible with current `aiohttp` versions (its response-building code
 predates a breaking constructor change in `aiohttp`'s `ClientResponse`).
+
+Phase 5's query-serving layer is tested at four increasingly real levels (see
+`ARCHITECTURE.md`, phase 5, "Testing this phase" for the full breakdown):
+discovery logic against `InMemoryServiceRegistry` alone, fan-out/merge/failover
+against real `distributed-index-sharding` shard servers over real sockets
+(`aiohttp.test_utils.TestServer`, no subprocess), a real `serve-shard`
+subprocess wrapped by `ShardReplicaService`, and — the only test in this repo
+that needs a running Docker daemon —
+`tests/test_query_docker_shard_failover.py`, which brings up this repo's
+actual `docker-compose.yml` via the `docker compose` CLI, kills real
+containers, and asserts the coordinator degrades/fails over correctly. It
+skips itself automatically if Docker is not running or if the fixed ports
+`docker-compose.yml` publishes are already bound by another stack.
 
 ## Troubleshooting
 
@@ -608,6 +749,36 @@ predates a breaking constructor change in `aiohttp`'s `ClientResponse`).
   in `pagerank-link-analysis`'s own `models.py` for what each count means;
   this is not an error, just visibility into how much of the raw link graph
   fell outside the `doc_id` space (`ARCHITECTURE.md`, phase 4, section 4).
+- **`shard-replica` keeps restarting with `QueryServingError: no hay ningún
+  objeto bajo 'shard-index/shard-<N>'...`:** `shard-index` hasn't run yet, or
+  ran with a different `--num-shards`/`--shard-index-prefix` than this
+  replica's `--shard-id`/`--shard-index-prefix` expect — run `shard-index`
+  first (see "Distributed query serving (phase 5)" above); `restart:
+  on-failure` keeps retrying the container in the meantime, it does not
+  crash-loop opaquely.
+- **`search`/`DistributedQueryServingPipeline` raises `QueryServingError:
+  ninguna réplica viva registrada`:** every `shard_id` currently has zero live
+  replicas — either none have started yet, or all of them let their TTL
+  expire (crashed, or Consul/the registry itself was restarted, see
+  `ARCHITECTURE.md`, phase 5, "Known limitations"). Check
+  `docker compose ps shard-0 shard-1 shard-2` and `GET
+  http://localhost:8500/v1/health/service/beacon-scale-shard?passing=true`
+  directly against Consul.
+- **A shard replica registers, but nothing can ever reach it from outside its
+  own container's network:** its `--announce-host` defaults to
+  `socket.gethostname()` (the container's own short hostname), resolvable
+  only by other containers on the same Docker Compose network — never from
+  the host machine, and never across a NAT/firewall boundary in a real
+  multi-machine deployment. Pass an explicit `--announce-host` (a real,
+  routable address) when running `shard-replica` outside a single Compose
+  network.
+- **A killed `shard-0` container's replacement still can't be reached even
+  though `docker compose ps` shows it running again:** `restart: on-failure`
+  starts a *new* container with a *new* hostname (see "Distributed crawling
+  (phase 1)" above for the same mechanic applied to `--worker-id`) — it
+  re-registers itself under a fresh `service_id`/`host` once it passes its
+  own health check; give it a few seconds, then re-check Consul's `passing`
+  list rather than assuming the old registration comes back.
 
 ## License
 
