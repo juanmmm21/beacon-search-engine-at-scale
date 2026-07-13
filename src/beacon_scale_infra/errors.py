@@ -54,3 +54,22 @@ class PageRankPhaseError(BeaconScaleInfraError):
     materializado queda vacío pese a que `crawl-pages/` no lo está -- nunca se
     deja escapar la excepción cruda de `pagerank-link-analysis` sin envolver
     (ver `ARCHITECTURE.md`, fase 4)."""
+
+
+class ShardIndexingError(BeaconScaleInfraError):
+    """Fallo del job de particionado de shards (fase 5): no existe el índice
+    global de fase 3 en el bucket esperado, o `distributed_index_sharding
+    .partitioning.partition_index` no puede leerlo -- nunca se deja escapar
+    la excepción cruda de `distributed-index-sharding` sin envolver (ver
+    `ARCHITECTURE.md`, fase 5)."""
+
+
+class QueryServingError(BeaconScaleInfraError):
+    """Fallo de la capa de orquestación de query serving distribuido (fase
+    5): ninguna réplica viva registrada para un `shard_id` conocido, una
+    instancia descubierta sin metadata `shard_id` válida, o un fallo al
+    registrar/dar de baja una réplica de shard en el `ServiceRegistry` --
+    nunca confundido con `ServiceRegistryError` (que es del propio registro),
+    ni con un `ShardOutcome` degradado de `distributed-index-sharding` (que
+    es tolerancia a fallo esperada, no un error de esta capa; ver
+    `ARCHITECTURE.md`, fase 5)."""
