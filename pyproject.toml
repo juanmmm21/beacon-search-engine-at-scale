@@ -19,7 +19,7 @@ dependencies = [
     "inverted-index-builder @ git+https://github.com/juanmmm21/inverted-index-builder.git@feat/beacon-roadmap",
     "index-compression-codec @ git+https://github.com/juanmmm21/index-compression-codec.git@feat/beacon-roadmap",
     "pagerank-link-analysis @ git+https://github.com/juanmmm21/pagerank-link-analysis.git@main",
-    "distributed-index-sharding @ git+https://github.com/juanmmm21/distributed-index-sharding.git@main",
+    "distributed-index-sharding @ git+https://github.com/juanmmm21/distributed-index-sharding.git@feat/beacon-roadmap",
     "query-parser-autocomplete @ git+https://github.com/juanmmm21/query-parser-autocomplete.git@main",
     "learning-to-rank-reranker @ git+https://github.com/juanmmm21/learning-to-rank-reranker.git@main",
     # La app insignia se reutiliza como dependencia de paquete real (fase 6):
