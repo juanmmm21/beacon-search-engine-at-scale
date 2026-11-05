@@ -10,9 +10,10 @@ tanto:
    fusión y los tombstones de esta generación);
 2. subir `segments.json` — el "commit" visible: un lector que lo descarga
    encuentra ya en el almacenamiento todo lo que referencia;
-3. subir `index_version.json` con la versión de esa instantánea, el mismo
-   marcador que usan `build-index` y `shard-index` (`index/index_version.py`),
-   para que la caché de la consola invalide por versión igual que hoy;
+3. subir `snapshot.json` (versión + hash del manifiesto al que corresponde)
+   e `index_version.json` con esa versión, el mismo marcador que usan
+   `build-index` y `shard-index` (`index/index_version.py`), para que la
+   caché de la consola invalide por versión igual que hoy;
 4. borrar lo que ya no referencia ni este manifiesto ni el anterior. El
    anterior se conserva una generación de gracia: un lector que acaba de
    descargar el manifiesto viejo todavía puede descargar sus segmentos.
@@ -25,6 +26,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Final
 
@@ -63,11 +65,32 @@ def manifest_files(root: Path, manifest: SegmentsManifest) -> list[str]:
     return sorted(files)
 
 
-def snapshot_version(manifest_bytes: bytes) -> str:
-    """Versión de contenido de una instantánea: el hash de su manifiesto.
-    Basta con él porque todo lo que referencia es inmutable y el manifiesto
-    lleva la generación, que crece en cada commit."""
+SNAPSHOT_POINTER: Final[str] = "snapshot.json"
+
+
+def snapshot_version(manifest_bytes: bytes, file_hashes: Mapping[str, str]) -> str:
+    """Versión de contenido de una instantánea: el manifiesto más el hash de
+    cada fichero que referencia. El manifiesto solo no basta: los nombres de
+    segmento (`seg-000001`) y los recuentos coinciden entre dos índices
+    construidos por separado con contenidos distintos."""
+    digest = hashlib.sha256(manifest_bytes)
+    for relative in sorted(file_hashes):
+        digest.update(b"\x00" + relative.encode("utf-8") + b"\x00")
+        digest.update(file_hashes[relative].encode("ascii"))
+    return digest.hexdigest()
+
+
+def manifest_digest(manifest_bytes: bytes) -> str:
     return hashlib.sha256(manifest_bytes).hexdigest()
+
+
+def parse_snapshot_pointer(raw: bytes) -> tuple[str, str]:
+    """`(index_version, sha256 del manifiesto)` de `snapshot.json`."""
+    try:
+        data = json.loads(raw)
+        return str(data["index_version"]), str(data["manifest_sha256"])
+    except (json.JSONDecodeError, KeyError, TypeError) as error:
+        raise IncrementalIndexingError(f"snapshot.json ilegible: {error}") from error
 
 
 class SnapshotPublisher:
@@ -82,6 +105,8 @@ class SnapshotPublisher:
         self._prefix = prefix.strip("/")
         self._uploaded: set[str] | None = None
         self._previous_files: frozenset[str] = frozenset()
+        # Los ficheros son inmutables: su hash se calcula una vez por proceso.
+        self._hashes: dict[str, str] = {}
 
     def _key(self, relative: str) -> str:
         return f"{self._prefix}/{relative}"
@@ -116,11 +141,22 @@ class SnapshotPublisher:
             )
             remote.add(relative)
 
-        version = snapshot_version(manifest_bytes)
+        for relative in files:
+            if relative not in self._hashes:
+                self._hashes[relative] = hashlib.sha256((root / relative).read_bytes()).hexdigest()
+        version = snapshot_version(manifest_bytes, {f: self._hashes[f] for f in files})
         await self._storage.put_object(
             self._bucket,
             self._key(SEGMENTS_MANIFEST_FILENAME),
             manifest_bytes,
+            content_type="application/json",
+        )
+        await self._storage.put_object(
+            self._bucket,
+            self._key(SNAPSHOT_POINTER),
+            json.dumps(
+                {"index_version": version, "manifest_sha256": manifest_digest(manifest_bytes)}
+            ).encode("utf-8"),
             content_type="application/json",
         )
         await self._storage.put_object(
@@ -131,15 +167,25 @@ class SnapshotPublisher:
         )
 
         keep = set(files) | self._previous_files
-        keep.update({SEGMENTS_MANIFEST_FILENAME, INDEX_VERSION_MARKER_BASENAME})
+        keep.update({SEGMENTS_MANIFEST_FILENAME, INDEX_VERSION_MARKER_BASENAME, SNAPSHOT_POINTER})
         for relative in sorted(remote - keep):
             await self._storage.delete_object(self._bucket, self._key(relative))
             remote.discard(relative)
         self._previous_files = frozenset(files)
+        for relative in list(self._hashes):
+            if relative not in keep:
+                del self._hashes[relative]
         return version
 
 
-async def restore_snapshot(storage: ObjectStorage, bucket: str, prefix: str, root: Path) -> bool:
+async def restore_snapshot(
+    storage: ObjectStorage,
+    bucket: str,
+    prefix: str,
+    root: Path,
+    *,
+    expected_manifest_sha256: str | None = None,
+) -> bool:
     """Descarga en `root` (que no debe existir o estar vacío) la última
     instantánea publicada. Devuelve `False` si no hay ninguna publicada.
 
@@ -152,6 +198,14 @@ async def restore_snapshot(storage: ObjectStorage, bucket: str, prefix: str, roo
         manifest_bytes = await storage.get_object(bucket, f"{prefix}/{SEGMENTS_MANIFEST_FILENAME}")
     except ObjectNotFoundError:
         return False
+    if (
+        expected_manifest_sha256 is not None
+        and manifest_digest(manifest_bytes) != expected_manifest_sha256
+    ):
+        raise IncrementalIndexingError(
+            "el manifiesto publicado cambió entre leer snapshot.json y descargarlo: "
+            "hay una publicación en curso, reintentar"
+        )
     try:
         manifest = SegmentsManifest.from_json_dict(json.loads(manifest_bytes))
     except (json.JSONDecodeError, SegmentedIndexError) as error:

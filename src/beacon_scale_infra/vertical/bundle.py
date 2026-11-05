@@ -35,7 +35,11 @@ from inverted_index_builder.segments import SegmentedIndex, SegmentedIndexError
 
 from beacon_scale_infra.errors import IncrementalIndexingError, ObjectNotFoundError
 from beacon_scale_infra.incremental.indexer import document_key
-from beacon_scale_infra.incremental.snapshot import restore_snapshot, snapshot_version
+from beacon_scale_infra.incremental.snapshot import (
+    SNAPSHOT_POINTER,
+    parse_snapshot_pointer,
+    restore_snapshot,
+)
 from beacon_scale_infra.protocols import ObjectStorage
 from beacon_scale_infra.vertical.sources import VerticalSources
 
@@ -74,10 +78,10 @@ async def export_bundle(
     """Exporta la última instantánea publicada. `None` si aún no hay
     ninguna; si `current` ya es esa versión, no hace nada."""
     try:
-        manifest_bytes = await storage.get_object(bucket, f"{index_prefix}/segments.json")
+        pointer = await storage.get_object(bucket, f"{index_prefix}/{SNAPSHOT_POINTER}")
     except ObjectNotFoundError:
         return None
-    version = snapshot_version(manifest_bytes)
+    version, manifest_sha256 = parse_snapshot_pointer(pointer)
     target = root / f"bundle-{version[:16]}"
     if current_bundle_version(root) == version:
         return BundleExport(target, version, 0, 0, reused=True)
@@ -86,7 +90,13 @@ async def export_bundle(
     staging = root / f".staging-{version[:16]}"
     if staging.exists():
         shutil.rmtree(staging)
-    if not await restore_snapshot(storage, bucket, index_prefix, staging / "index"):
+    if not await restore_snapshot(
+        storage,
+        bucket,
+        index_prefix,
+        staging / "index",
+        expected_manifest_sha256=manifest_sha256,
+    ):
         return None
     try:
         index = SegmentedIndex.open(staging / "index")

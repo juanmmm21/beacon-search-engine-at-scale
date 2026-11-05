@@ -302,3 +302,31 @@ async def test_extract_worker_publishes_upserts_when_configured(tmp_path: Path) 
     stats = await IncrementalIndexer(_config(tmp_path), queue=queue, storage=storage).run()
     assert stats.documents_upserted == 1
     assert _live_texts(tmp_path / "work") == {"https://a.test/article": "Article"}
+
+
+async def test_same_shape_different_content_gets_a_different_version(tmp_path: Path) -> None:
+    versions = []
+    for name, text in (("a", "alpha search"), ("b", "beta ranking")):
+        storage = LocalFilesystemObjectStorage(tmp_path / f"storage-{name}")
+        queue = InMemoryMessageQueue()
+        await publish_updates(
+            queue, _STREAM, [IndexUpdate.upsert(_document("https://a.test/1", text))]
+        )
+        stats = await IncrementalIndexer(
+            _config(tmp_path, local_root=tmp_path / f"work-{name}"), queue=queue, storage=storage
+        ).run()
+        pointer = json.loads(await storage.get_object(_BUCKET, f"{_PREFIX}/snapshot.json"))
+        assert pointer["index_version"] == stats.last_index_version
+        versions.append(stats.last_index_version)
+    assert versions[0] != versions[1]
+
+
+async def test_restore_detects_a_manifest_swapped_mid_download(tmp_path: Path) -> None:
+    storage = LocalFilesystemObjectStorage(tmp_path / "storage")
+    queue = InMemoryMessageQueue()
+    await publish_updates(queue, _STREAM, [IndexUpdate.upsert(_document("https://a.test/a", "x"))])
+    await IncrementalIndexer(_config(tmp_path), queue=queue, storage=storage).run()
+    with pytest.raises(IncrementalIndexingError):
+        await restore_snapshot(
+            storage, _BUCKET, _PREFIX, tmp_path / "r", expected_manifest_sha256="0" * 64
+        )
