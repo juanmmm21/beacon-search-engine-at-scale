@@ -573,6 +573,74 @@ rather than ever mixing two builds silently.
 CDN story (what is static, what must reach the backend, and what invalidates
 what) is documented in `ARCHITECTURE.md`, phase 6, section 8.
 
+## Incremental indexing
+
+`build-index` (phase 3) rebuilds the whole global index from every partition:
+the cost is proportional to the corpus, not to what changed.
+`src/beacon_scale_infra/incremental/` keeps an index up to date instead, on top
+of the immutable segments of
+[`inverted-index-builder`](https://github.com/juanmmm21/inverted-index-builder)
+(≥ 0.2.0): every batch of changes becomes one new segment, an updated page is
+tombstoned in its old segment and re-added, a removed page is only tombstoned,
+and a tiered merge policy rewrites small segments (and purges deleted
+documents) in the background of the same process.
+
+```text
+extract-worker --index-updates-stream ─┐
+                                       ├─► Redis stream ─► index-updater ─► segments.json + seg-*/ + deletes/
+web-crawler-scheduler recrawl          │   (IndexUpdate:     (one writer;      published to MinIO,
+  └─► feed-recrawl ────────────────────┘    upsert/delete)    volume-backed)   index_version.json last
+```
+
+- **Producers.** `extract-worker --index-updates-stream beacon-scale-index-updates`
+  publishes every extracted document as an upsert, after writing its part
+  file, so the batch and incremental indexes never disagree.
+  `feed-recrawl <dir>` reads the output of `web-crawler-scheduler recrawl`
+  (≥ 0.2.0): changed pages are extracted with the same function
+  `extract-worker` uses and become upserts (or deletes, if they no longer
+  carry indexable content); 404/410 pages become deletes. Unchanged pages
+  produce no work at all, which is the point of recrawling by change rate.
+- **The updater.** `index-updater` batches messages (up to
+  `--flush-every-updates`, or fewer as soon as the stream goes quiet),
+  keeps the last operation per URL, writes the segment and tombstones,
+  applies the merge policy and publishes a snapshot — and only then acks the
+  batch. Delivery is at least once; replaying an upsert or a delete is safe.
+- **Snapshots.** Segments and tombstone files are immutable, so publishing
+  uploads only new files, then `segments.json` (the commit point readers
+  see), then `index_version.json` (the sha256 of that manifest, the same
+  marker the console cache already keys on). Files the previous manifest
+  referenced are kept for one generation of grace for readers mid-download.
+  A new updater with an empty volume restores the last snapshot and carries
+  on with the same `doc_id` sequence.
+- **Near-duplicates.** Every document extracted here now carries the 64-bit
+  SimHash of `html-content-extractor` (≥ 0.2.0) in its `simhash` field.
+
+### Running it
+
+```bash
+docker compose up -d index-updater
+python -m beacon_scale_infra extract-worker --storage-backend s3 \
+  --index-updates-stream beacon-scale-index-updates
+web-crawler-scheduler recrawl --state recrawl_state.json --output-dir recrawl-001
+python -m beacon_scale_infra feed-recrawl recrawl-001
+```
+
+### Measured
+
+FiQA-2018 from BEIR as the corpus (57,638 documents), AMD Ryzen 7 7700X under
+WSL2, Python 3.12.3, local filesystem object storage, measured 2026-11-05:
+
+- full rebuild with `inverted-index-builder` (build + write): 22.01 s;
+- first load of the same corpus as one segment, published: 23.87 s;
+- 10 incremental batches of 100 changes each (80 upserts of modified
+  documents, 20 deletes) on top of it, from first message to published
+  snapshot: p50 36 ms, max 157 ms (the slow ones include the 2 tier merges
+  that happened).
+
+The phase-5 shard cluster still serves the batch index: re-sharding a
+segmented index and reloading shard replicas live is not wired yet (see
+`ARCHITECTURE.md`, "Incremental indexing", known limitations).
+
 ## Requirements and installation
 
 - Python `>=3.11`
@@ -691,6 +759,13 @@ object, message, or service instance, and prints every step.
   `total_documents` and the corpus-wide `last_crawled_at` — what the console
   uses to resolve `doc_id -> text` on demand instead of loading the corpus
   file whole (`index/corpus_catalog.py`).
+- **The segmented index** (`search-index-segmented/` by default) is exactly
+  `inverted-index-builder`'s segmented format v1 (`segments.json`, `seg-*/`,
+  `deletes/`), plus the same `index_version.json` marker, keyed by the hash of
+  `segments.json`.
+- **Index updates** on `beacon-scale-index-updates` are
+  `{"operation": "upsert", "url": ..., "document": {<ExtractedDocument JSON>}}`
+  or `{"operation": "delete", "url": ...}` (`incremental/models.py`).
 - **The LTR model** (`ltr-model/` by default) is exactly
   `learning-to-rank-reranker`'s own saved-model directory (`model.txt` +
   `manifest.json`), published by the `train-reranker` job, unmodified.

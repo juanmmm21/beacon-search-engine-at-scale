@@ -1820,3 +1820,80 @@ blue/green index swaps (see "Known limitations"), stand up a CDN (section 8
 documents the split), add authentication/rate limiting to the API, or feed
 autocomplete with a real query log (the synthetic default of
 `query-parser-autocomplete` is used, exactly like the reference app).
+
+## Incremental indexing
+
+Phases 3 to 6 treat the index as a batch artifact: crawl, extract, rebuild,
+re-shard, restart. That is right for a first build and wrong for keeping a
+live corpus fresh, where a day's changes are a fraction of a percent of the
+pages. This part of the roadmap replaces "rebuild" with "apply the delta".
+
+### 1. The storage model comes from `inverted-index-builder`, not from here
+
+Segments, tombstones, the atomic `segments.json` swap and the tiered merge
+policy live in `inverted-index-builder` (≥ 0.2.0, `segments.py`) and are
+consumed unmodified, like every other component. This repo adds only what is
+distributed: the queue contract, one writer per index, and publishing
+snapshots to object storage.
+
+### 2. One writer, many producers
+
+A segmented index accepts a single writer (its lock is a process lock). The
+`index-updater` service is therefore not scaled with `--scale`: scaling
+writes means one index per shard, each with its own updater, not two
+updaters on one index. Producers (extract workers, `feed-recrawl`) scale
+freely: they only publish to a Redis stream.
+
+### 3. Ack after publish
+
+A batch is acked only once its snapshot is published. If the process dies
+in between, the batch is redelivered and applied again, which is harmless:
+an upsert replayed leaves the same content live under a new `doc_id`, a
+delete replayed is a no-op. Exactly-once would need a transaction spanning
+Redis and MinIO; at-least-once with idempotent effects does not.
+
+### 4. Publishing is upload-then-swap
+
+Everything a manifest references is immutable, so a snapshot is: upload the
+files that are new, upload `segments.json`, upload `index_version.json`.
+Object puts are atomic in S3/MinIO, so a reader always sees a manifest whose
+files already exist. Files only the previous manifest referenced are kept
+one more generation, so a reader that fetched the old manifest an instant
+before the swap can still finish downloading it.
+
+### 5. Version = hash of the manifest
+
+The manifest carries a generation that grows on every commit and names every
+immutable file, so its sha256 identifies the whole snapshot. It is written
+with the same `index_version.json` marker phase 3 introduced, so the console
+cache invalidation of phase 6 applies unchanged.
+
+### 6. The recrawl bridge
+
+`web-crawler-scheduler recrawl` (≥ 0.2.0) already does the expensive part —
+deciding which pages are due by their estimated change rate and confirming
+"unchanged" with a conditional GET. Its output is only the delta (changed
+pages, removed pages), and `feed-recrawl` turns that delta into updates
+using the same extraction function as `extract-worker`.
+
+### Measured
+
+On FiQA-2018 (57,638 documents, Ryzen 7 7700X, WSL2, local storage): full
+rebuild 22.01 s; incremental batches of 100 changes published in p50 36 ms,
+max 157 ms including tier merges. The rebuild grows with the corpus; the
+batch grows with the batch.
+
+### Known limitations
+
+- The phase-5 shard cluster still serves the batch index. Feeding it from the
+  segmented index means re-sharding a snapshot and reloading replicas live,
+  the same live-reload gap phase 6 already documents; the corpus catalog
+  also assumes contiguous `doc_id`s, which a segmented index (stable IDs with
+  gaps after merges) does not give.
+- Near-duplicate detection across the distributed corpus is not enforced at
+  indexing time: every document carries its SimHash, but a shared
+  fingerprint index between extract workers is future work.
+- The local working copy is the only place where a batch exists between
+  "segment written" and "snapshot published"; losing the volume in that
+  window loses nothing, because the batch was not acked and is redelivered.
+
