@@ -17,6 +17,7 @@ import logging
 import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
+from urllib.parse import urldefrag
 
 import aiohttp
 from html_content_extractor.models import ExtractedDocument, ExtractionConfig
@@ -70,7 +71,12 @@ class SourceCrawlReport:
 
 
 def tag_document(document: ExtractedDocument, source: DocSource) -> dict[str, object]:
+    """Documento extraído + su fuente. La URL pierde el fragmento: el crawler
+    deduplica sin él, así que `pagina.html#seccion` es la página entera, y
+    con el fragmento el resultado enlazaría a una sección cualquiera."""
     record: dict[str, object] = document.to_json_dict()
+    record["url"] = urldefrag(document.url).url
+    record["final_url"] = urldefrag(document.final_url).url
     record["source_id"] = source.source_id
     return record
 

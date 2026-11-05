@@ -10,6 +10,7 @@ from typing import Any
 
 import pytest
 from aiohttp import web
+from html_content_extractor.models import ExtractionConfig
 
 from beacon_scale_infra.incremental.indexer import (
     IncrementalIndexer,
@@ -20,7 +21,11 @@ from beacon_scale_infra.incremental.models import IncrementalIndexerConfig, Inde
 from beacon_scale_infra.queue.memory import InMemoryMessageQueue
 from beacon_scale_infra.storage.local import LocalFilesystemObjectStorage
 from beacon_scale_infra.vertical.bundle import CURRENT_LINK, current_bundle_version, export_bundle
-from beacon_scale_infra.vertical.pipeline import VerticalCrawlConfig, crawl_vertical
+from beacon_scale_infra.vertical.pipeline import (
+    VerticalCrawlConfig,
+    crawl_vertical,
+    updates_from_pages,
+)
 from beacon_scale_infra.vertical.sources import (
     DocSource,
     VerticalSources,
@@ -137,6 +142,35 @@ async def test_crawl_respects_scope_robots_and_budget(tmp_path: Path) -> None:
     assert "/docs/private" not in requested
     assert len(updates) == 3
     assert all(u.document is not None and u.document["source_id"] == "docs" for u in updates)
+
+
+def test_tagged_documents_drop_the_url_fragment(tmp_path: Path) -> None:
+    pages = tmp_path / "pages.jsonl"
+    url = "https://docs.python.org/3/library/asyncio-task.html#asyncio.timeout"
+    pages.write_text(
+        json.dumps(
+            {
+                "url": url,
+                "final_url": url,
+                "status_code": 200,
+                "headers": {"Content-Type": "text/html"},
+                "html": _page("Coroutines and tasks", []),
+                "fetched_at": "2026-11-05T09:00:00+00:00",
+                "depth": 1,
+            }
+        )
+        + "\n"
+    )
+    source = _source(
+        "python",
+        "https://docs.python.org",
+        allowed_prefixes=("https://docs.python.org/3/",),
+        seeds=("https://docs.python.org/3/",),
+    )
+    updates, _, _ = updates_from_pages(pages, source, ExtractionConfig())
+    assert updates[0].url == "https://docs.python.org/3/library/asyncio-task.html"
+    assert updates[0].document is not None
+    assert updates[0].document["final_url"] == updates[0].url
 
 
 def _doc(url: str, text: str) -> dict[str, Any]:
