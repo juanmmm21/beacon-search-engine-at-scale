@@ -1861,12 +1861,19 @@ files already exist. Files only the previous manifest referenced are kept
 one more generation, so a reader that fetched the old manifest an instant
 before the swap can still finish downloading it.
 
-### 5. Version = hash of the manifest
+### 5. Version = manifest plus the hash of every file
 
-The manifest carries a generation that grows on every commit and names every
-immutable file, so its sha256 identifies the whole snapshot. It is written
-with the same `index_version.json` marker phase 3 introduced, so the console
-cache invalidation of phase 6 applies unchanged.
+The first version of this hashed only `segments.json`, on the reasoning that
+the manifest names every immutable file. It does not identify their content:
+two indexes built separately with different documents but the same shape
+(`seg-000001`, same counts) produced the same version, which showed up when
+the documentation vertical was reindexed from scratch. The version is now a
+sha256 over the manifest and the hash of each file it references, computed
+once per file by the publisher. It is published in `snapshot.json` together
+with the manifest's own hash, so a reader can check that the manifest it
+downloaded is the one that version describes (and retry if a publication
+landed in between), and in the same `index_version.json` marker phase 3
+introduced, so the console cache invalidation of phase 6 applies unchanged.
 
 ### 6. The recrawl bridge
 
@@ -1883,8 +1890,24 @@ rebuild 22.01 s; incremental batches of 100 changes published in p50 36 ms,
 max 157 ms including tier merges. The rebuild grows with the corpus; the
 batch grows with the batch.
 
+### 7. The documentation vertical
+
+Beacon Docs reuses this machinery end to end: `vertical-crawl` produces
+upserts, the incremental indexer (with its optional document store, which
+keeps the full text of every live document in step with each snapshot)
+publishes snapshots, and `export-vertical` turns them into a bundle on disk.
+The bundle exists because the console cannot read this repo's object storage
+abstractions (this repo depends on the console, not the other way round), and
+a directory with a documented format is the ecosystem's usual contract.
+Swapping a symlink with `os.replace` makes the switch atomic for readers.
+
 ### Known limitations
 
+- The vertical refresh re-crawls every source in full (within budget) and
+  upserts every page. Pages that disappeared are not deleted unless they are
+  re-crawled and fail; switching the refresher to `web-crawler-scheduler
+  recrawl` + `feed-recrawl` (revisits by change rate, 404/410 become
+  deletes) is the next step.
 - The phase-5 shard cluster still serves the batch index. Feeding it from the
   segmented index means re-sharding a snapshot and reloading replicas live,
   the same live-reload gap phase 6 already documents; the corpus catalog

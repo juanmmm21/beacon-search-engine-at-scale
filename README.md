@@ -607,8 +607,9 @@ web-crawler-scheduler recrawl          │   (IndexUpdate:     (one writer;     
   batch. Delivery is at least once; replaying an upsert or a delete is safe.
 - **Snapshots.** Segments and tombstone files are immutable, so publishing
   uploads only new files, then `segments.json` (the commit point readers
-  see), then `index_version.json` (the sha256 of that manifest, the same
-  marker the console cache already keys on). Files the previous manifest
+  see), then `snapshot.json` and `index_version.json` with the snapshot's
+  version (a sha256 over the manifest and the hash of every file it
+  references; the same marker the console cache already keys on). Files the previous manifest
   referenced are kept for one generation of grace for readers mid-download.
   A new updater with an empty volume restores the last snapshot and carries
   on with the same `doc_id` sequence.
@@ -624,6 +625,47 @@ python -m beacon_scale_infra extract-worker --storage-backend s3 \
 web-crawler-scheduler recrawl --state recrawl_state.json --output-dir recrawl-001
 python -m beacon_scale_infra feed-recrawl recrawl-001
 ```
+
+### Documentation vertical
+
+`src/beacon_scale_infra/vertical/` feeds Beacon Docs, the public
+documentation search of
+[`beacon-search-console`](https://github.com/juanmmm21/beacon-search-console).
+
+- **Curated sources** (`deploy/vertical-sources.json`, format v1): Python 3
+  docs, the Rust book and standard library, MDN Web Docs, each with seeds,
+  allowed URL prefixes, a page budget, its license, license URL and
+  attribution, plus a global page budget. A source without a known license
+  cannot be declared. Swift's book is listed but disabled with its reason:
+  docs.swift.org serves it as a client-rendered DocC app with no content in
+  the HTML.
+- **`vertical-crawl`** crawls the sources concurrently (different domains)
+  with `web-crawler-scheduler` scoped to each source's prefixes
+  (`--allow-prefix`, ≥ 0.2.0): robots.txt and Crawl-delay always on, at
+  least 0.5 s between requests and at most 4 at once per domain (enforced by
+  config validation), pages that redirect out of scope dropped. Pages are
+  extracted like `extract-worker` does, tagged with their `source_id`, and
+  either published as index updates or applied in-process (`--apply-inline`,
+  no Redis needed).
+- **`export-vertical`** turns the last snapshot into a bundle for the
+  console: `index/` (segmented index), `documents.jsonl` (live documents
+  with text and source), `sources.json` and `manifest.json`, written to a new
+  directory and switched in by atomically replacing a `current` symlink; the
+  previous bundle is kept for readers still on it. `--watch-seconds` makes it
+  a service.
+
+```bash
+python -m beacon_scale_infra vertical-crawl --apply-inline \
+  --storage-backend local --local-storage-root .vertical/storage --bucket beacon-vertical
+python -m beacon_scale_infra export-vertical --output-root .vertical/bundles \
+  --storage-backend local --local-storage-root .vertical/storage --bucket beacon-vertical
+# Or over MinIO + Redis:
+docker compose --profile vertical up -d vertical-index-updater vertical-exporter
+docker compose --profile vertical run --rm vertical-crawl
+```
+
+Measured on 2026-11-05: 1,200 pages (400 per source) crawled in 7 minutes
+with no page discarded, 1,198 indexed (2 Rust pages had no main content).
 
 ### Measured
 
@@ -763,6 +805,11 @@ object, message, or service instance, and prints every step.
   `inverted-index-builder`'s segmented format v1 (`segments.json`, `seg-*/`,
   `deletes/`), plus the same `index_version.json` marker, keyed by the hash of
   `segments.json`.
+- **The vertical bundle** (format v1, `vertical/bundle.py`): `current ->
+  bundle-<version>/` with `manifest.json` (`format:
+  "beacon-vertical-bundle"`, `format_version`, `index_version`),
+  `index/`, `documents.jsonl` and `sources.json`. Consumed by
+  `beacon-search-console`.
 - **Index updates** on `beacon-scale-index-updates` are
   `{"operation": "upsert", "url": ..., "document": {<ExtractedDocument JSON>}}`
   or `{"operation": "delete", "url": ...}` (`incremental/models.py`).
