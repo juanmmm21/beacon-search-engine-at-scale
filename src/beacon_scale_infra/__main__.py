@@ -36,6 +36,13 @@ en el almacenamiento de objetos (`train-reranker`, job por lotes) y arranca
 una réplica de la API de la consola sobre el clúster de fase 5
 (`serve-console`, servicio de larga duración, escalable a N réplicas tras un
 balanceador) -- ver `ARCHITECTURE.md`, fase 6.
+
+Indexación incremental (`index-updater`, `feed-recrawl`): aplica altas,
+actualizaciones y bajas como segmentos inmutables y publica cada
+instantánea, en vez de reconstruir con `build-index` (servicio de larga
+duración, un único escritor por índice); `feed-recrawl` encola lo que
+detectó un `web-crawler-scheduler recrawl` -- ver `ARCHITECTURE.md`,
+"Incremental indexing".
 """
 
 from __future__ import annotations
@@ -76,6 +83,9 @@ from beacon_scale_infra.crawl.worker import CrawlWorker
 from beacon_scale_infra.errors import BeaconScaleInfraError
 from beacon_scale_infra.extract.models import ExtractWorkerConfig
 from beacon_scale_infra.extract.worker import ExtractWorker
+from beacon_scale_infra.incremental.indexer import IncrementalIndexer, publish_updates
+from beacon_scale_infra.incremental.models import IncrementalIndexerConfig
+from beacon_scale_infra.incremental.recrawl_feed import updates_from_recrawl
 from beacon_scale_infra.index.models import IndexingPipelineConfig
 from beacon_scale_infra.index.pipeline import IndexingPipeline
 from beacon_scale_infra.models import ServiceInstance
@@ -219,8 +229,55 @@ def _build_parser() -> argparse.ArgumentParser:
         help="No detenerse nunca al quedarse sin trabajo (servicio de larga duración)",
     )
     extract_worker_parser.add_argument(
+        "--index-updates-stream",
+        default=None,
+        help="Publica además cada documento extraído como alta para el indexador incremental",
+    )
+    extract_worker_parser.add_argument(
         "--local-storage-root", type=Path, default=Path(".local-object-storage")
     )
+
+    index_updater_parser = subparsers.add_parser(
+        "index-updater",
+        help="Aplica altas/bajas de la cola al índice segmentado y publica cada instantánea",
+    )
+    index_updater_parser.add_argument("--worker-id", default=None)
+    index_updater_parser.add_argument(
+        "--queue-backend", choices=["memory", "redis"], default="redis"
+    )
+    index_updater_parser.add_argument("--storage-backend", choices=["local", "s3"], default="s3")
+    index_updater_parser.add_argument("--bucket", default="beacon-scale-dev")
+    index_updater_parser.add_argument("--index-prefix", default="search-index-segmented")
+    index_updater_parser.add_argument("--stream", default="beacon-scale-index-updates")
+    index_updater_parser.add_argument("--group", default="beacon-scale-incremental-indexer")
+    index_updater_parser.add_argument(
+        "--local-root",
+        type=Path,
+        default=Path(".incremental-index"),
+        help="Copia de trabajo local del índice segmentado (restaurada si no existe)",
+    )
+    index_updater_parser.add_argument("--flush-every-updates", type=int, default=500)
+    index_updater_parser.add_argument("--merge-segments-per-tier", type=int, default=4)
+    index_updater_parser.add_argument("--merge-max-deleted-ratio", type=float, default=0.3)
+    index_updater_parser.add_argument("--idle-polls-before-shutdown", type=int, default=3)
+    index_updater_parser.add_argument(
+        "--no-idle-shutdown",
+        action="store_true",
+        help="No detenerse nunca al quedarse sin trabajo (servicio de larga duración)",
+    )
+    index_updater_parser.add_argument(
+        "--local-storage-root", type=Path, default=Path(".local-object-storage")
+    )
+
+    feed_recrawl_parser = subparsers.add_parser(
+        "feed-recrawl",
+        help="Encola como altas/bajas lo que detectó 'web-crawler-scheduler recrawl'",
+    )
+    feed_recrawl_parser.add_argument("recrawl_output_dir", type=Path)
+    feed_recrawl_parser.add_argument(
+        "--queue-backend", choices=["memory", "redis"], default="redis"
+    )
+    feed_recrawl_parser.add_argument("--stream", default="beacon-scale-index-updates")
 
     build_index_parser = subparsers.add_parser(
         "build-index",
@@ -592,6 +649,7 @@ async def _run_extract_worker(args: argparse.Namespace) -> None:
         idle_polls_before_shutdown=(
             None if args.no_idle_shutdown else args.idle_polls_before_shutdown
         ),
+        index_updates_stream=args.index_updates_stream,
     )
 
     queue: MessageQueue
@@ -622,6 +680,73 @@ async def _run_extract_worker(args: argparse.Namespace) -> None:
         await storage.aclose()
     if isinstance(queue, RedisStreamsMessageQueue):
         await queue.aclose()
+
+
+def _build_queue(backend: str) -> MessageQueue:
+    if backend == "memory":
+        return InMemoryMessageQueue()
+    return RedisStreamsMessageQueue.from_url(
+        os.environ.get("BEACON_REDIS_URL", "redis://localhost:6379/0")
+    )
+
+
+def _build_storage(backend: str, local_root: Path) -> ObjectStorage:
+    if backend == "local":
+        return LocalFilesystemObjectStorage(local_root)
+    return S3ObjectStorage(
+        endpoint_url=_require_env("BEACON_S3_ENDPOINT_URL"),
+        access_key=_require_env("BEACON_S3_ACCESS_KEY"),
+        secret_key=_require_env("BEACON_S3_SECRET_KEY"),
+        region_name=os.environ.get("BEACON_S3_REGION", "us-east-1"),
+    )
+
+
+async def _run_index_updater(args: argparse.Namespace) -> None:
+    worker_id = args.worker_id or socket.gethostname()
+    config = IncrementalIndexerConfig(
+        worker_id=worker_id,
+        local_root=args.local_root,
+        stream=args.stream,
+        group=args.group,
+        bucket=args.bucket,
+        index_prefix=args.index_prefix,
+        flush_every_updates=args.flush_every_updates,
+        merge_segments_per_tier=args.merge_segments_per_tier,
+        merge_max_deleted_ratio=args.merge_max_deleted_ratio,
+        idle_polls_before_shutdown=(
+            None if args.no_idle_shutdown else args.idle_polls_before_shutdown
+        ),
+    )
+    queue = _build_queue(args.queue_backend)
+    storage = _build_storage(args.storage_backend, args.local_storage_root)
+    try:
+        print(f"[index-updater:{worker_id}] arrancando sobre {args.local_root}")
+        stats = await IncrementalIndexer(config, queue=queue, storage=storage).run()
+        print(
+            f"[index-updater:{worker_id}] terminado: +{stats.documents_upserted} "
+            f"-{stats.documents_deleted}, {stats.merges} fusión(es), "
+            f"{stats.live_documents} vivos, versión {stats.last_index_version}"
+        )
+    finally:
+        if isinstance(storage, S3ObjectStorage):
+            await storage.aclose()
+        if isinstance(queue, RedisStreamsMessageQueue):
+            await queue.aclose()
+
+
+async def _run_feed_recrawl(args: argparse.Namespace) -> None:
+    updates, summary = updates_from_recrawl(args.recrawl_output_dir)
+    queue = _build_queue(args.queue_backend)
+    try:
+        published = await publish_updates(queue, args.stream, updates)
+    finally:
+        if isinstance(queue, RedisStreamsMessageQueue):
+            await queue.aclose()
+    print(
+        f"[feed-recrawl] {published} actualización(es) encoladas: "
+        f"{summary.upserts} alta(s), {summary.no_longer_indexable} ya no indexable(s), "
+        f"{summary.removed_pages} desaparecida(s)"
+    )
 
 
 async def _run_build_index(args: argparse.Namespace) -> None:
@@ -880,6 +1005,10 @@ async def _dispatch(args: argparse.Namespace) -> None:
         await _run_extract_worker(args)
     elif args.command == "build-index":
         await _run_build_index(args)
+    elif args.command == "index-updater":
+        await _run_index_updater(args)
+    elif args.command == "feed-recrawl":
+        await _run_feed_recrawl(args)
     elif args.command == "compute-pagerank":
         await _run_compute_pagerank(args)
     elif args.command == "shard-index":

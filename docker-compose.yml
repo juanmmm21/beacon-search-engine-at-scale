@@ -166,6 +166,40 @@ services:
     # solo cuando esa cola lleva varios sondeos vacía.
     restart: on-failure
 
+  # --- Indexación incremental -----------------------------------------------
+  #
+  # Un único escritor por índice segmentado: este servicio no se escala con
+  # --scale (dos réplicas escribirían segmentos con los mismos doc_id). Su
+  # copia de trabajo vive en un volumen para no restaurarla desde MinIO en
+  # cada reinicio; si el volumen se pierde, la restaura de la última
+  # instantánea publicada. Se alimenta de 'extract-worker' arrancado con
+  # --index-updates-stream y de 'feed-recrawl' (ver README.md).
+  index-updater:
+    build: .
+    depends_on:
+      minio-init:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    environment:
+      BEACON_S3_ENDPOINT_URL: http://minio:9000
+      BEACON_S3_ACCESS_KEY: beacon-dev
+      BEACON_S3_SECRET_KEY: beacon-dev-secret
+      BEACON_REDIS_URL: redis://redis:6379/0
+    command:
+      - index-updater
+      - --queue-backend
+      - redis
+      - --storage-backend
+      - s3
+      - --local-root
+      - /var/lib/beacon/incremental-index
+      - --no-idle-shutdown
+    volumes:
+      - incremental-index:/var/lib/beacon/incremental-index
+    networks: [beacon-scale]
+    restart: on-failure
+
   # --- Fase 5: réplicas de shard (query serving distribuido) --------------
   #
   # Cada servicio 'shard-N' descarga su partición del índice (subida por el
@@ -331,3 +365,4 @@ networks:
 volumes:
   minio-data:
   redis-data:
+  incremental-index:
