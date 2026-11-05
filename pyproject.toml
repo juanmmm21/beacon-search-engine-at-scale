@@ -14,20 +14,20 @@ dependencies = [
     "boto3>=1.34,<2",
     "redis>=5,<6",
     "aiohttp>=3.9,<4",
-    "web-crawler-scheduler @ git+https://github.com/juanmmm21/web-crawler-scheduler.git@feat/beacon-roadmap",
-    "html-content-extractor @ git+https://github.com/juanmmm21/html-content-extractor.git@feat/beacon-roadmap",
-    "inverted-index-builder @ git+https://github.com/juanmmm21/inverted-index-builder.git@feat/beacon-roadmap",
-    "index-compression-codec @ git+https://github.com/juanmmm21/index-compression-codec.git@feat/beacon-roadmap",
-    "pagerank-link-analysis @ git+https://github.com/juanmmm21/pagerank-link-analysis.git@main",
-    "distributed-index-sharding @ git+https://github.com/juanmmm21/distributed-index-sharding.git@feat/beacon-roadmap",
-    "query-parser-autocomplete @ git+https://github.com/juanmmm21/query-parser-autocomplete.git@main",
-    "learning-to-rank-reranker @ git+https://github.com/juanmmm21/learning-to-rank-reranker.git@main",
+    "web-crawler-scheduler @ git+https://github.com/juanmmm21/web-crawler-scheduler.git@v0.2.0",
+    "html-content-extractor @ git+https://github.com/juanmmm21/html-content-extractor.git@v0.2.0",
+    "inverted-index-builder @ git+https://github.com/juanmmm21/inverted-index-builder.git@v0.2.0",
+    "index-compression-codec @ git+https://github.com/juanmmm21/index-compression-codec.git@v0.2.0",
+    "pagerank-link-analysis @ git+https://github.com/juanmmm21/pagerank-link-analysis.git@v0.1.0",
+    "distributed-index-sharding @ git+https://github.com/juanmmm21/distributed-index-sharding.git@v0.2.0",
+    "query-parser-autocomplete @ git+https://github.com/juanmmm21/query-parser-autocomplete.git@v0.1.0",
+    "learning-to-rank-reranker @ git+https://github.com/juanmmm21/learning-to-rank-reranker.git@v0.1.0",
     # La app insignia se reutiliza como dependencia de paquete real (fase 6):
     # su contrato de API versionado (models.py), la construcción de snippets
     # (build_snippet) y el lector de stats.json se importan sin modificar --
     # nunca se reescriben aquí (ver ARCHITECTURE.md, fase 6). El paquete
     # Python vive en el subdirectorio backend/ de ese repo.
-    "beacon-search-console @ git+https://github.com/juanmmm21/beacon-search-console.git@feat/beacon-roadmap#subdirectory=backend",
+    "beacon-search-console @ git+https://github.com/juanmmm21/beacon-search-console.git@v0.2.0#subdirectory=backend",
     "fastapi>=0.110,<1",
     "uvicorn[standard]>=0.29,<1",
 ]
