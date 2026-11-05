@@ -1,0 +1,71 @@
+{
+  "format_version": 1,
+  "total_page_budget": 1200,
+  "sources": [
+    {
+      "source_id": "python",
+      "name": "Python 3 documentation",
+      "seeds": [
+        "https://docs.python.org/3/tutorial/index.html",
+        "https://docs.python.org/3/library/index.html"
+      ],
+      "allowed_prefixes": [
+        "https://docs.python.org/3/"
+      ],
+      "max_pages": 400,
+      "license": "PSF License Version 2 (documentation); Zero-Clause BSD (code examples)",
+      "license_url": "https://docs.python.org/3/license.html",
+      "attribution": "© Python Software Foundation",
+      "enabled": true
+    },
+    {
+      "source_id": "rust",
+      "name": "The Rust Programming Language and the Rust standard library",
+      "seeds": [
+        "https://doc.rust-lang.org/book/",
+        "https://doc.rust-lang.org/std/index.html"
+      ],
+      "allowed_prefixes": [
+        "https://doc.rust-lang.org/book/",
+        "https://doc.rust-lang.org/std/"
+      ],
+      "max_pages": 400,
+      "license": "MIT OR Apache-2.0",
+      "license_url": "https://github.com/rust-lang/book/blob/main/LICENSE-MIT",
+      "attribution": "© The Rust Project Developers",
+      "enabled": true
+    },
+    {
+      "source_id": "mdn",
+      "name": "MDN Web Docs",
+      "seeds": [
+        "https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference",
+        "https://developer.mozilla.org/en-US/docs/Web/HTML/Reference"
+      ],
+      "allowed_prefixes": [
+        "https://developer.mozilla.org/en-US/docs/Web/"
+      ],
+      "max_pages": 400,
+      "license": "CC-BY-SA 2.5 (prose); CC0 (code samples)",
+      "license_url": "https://developer.mozilla.org/en-US/docs/MDN/Writing_guidelines/Attrib_copyright_license",
+      "attribution": "© Mozilla Contributors",
+      "enabled": true
+    },
+    {
+      "source_id": "swift",
+      "name": "The Swift Programming Language",
+      "seeds": [
+        "https://docs.swift.org/swift-book/documentation/the-swift-programming-language/"
+      ],
+      "allowed_prefixes": [
+        "https://docs.swift.org/swift-book/"
+      ],
+      "max_pages": 400,
+      "license": "CC BY 4.0",
+      "license_url": "https://docs.swift.org/swift-book/documentation/the-swift-programming-language/aboutswift/",
+      "attribution": "© Apple Inc. and the Swift project authors",
+      "enabled": false,
+      "disabled_reason": "docs.swift.org/swift-book is a DocC app rendered client-side: its HTML has no content without JavaScript (checked 2026-11-05). Needs a reader for DocC's JSON before it can be crawled."
+    }
+  ]
+}
