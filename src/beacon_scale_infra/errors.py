@@ -91,3 +91,11 @@ class ConsoleServingError(BeaconScaleInfraError):
     versión de índice ilegible -- nunca confundido con la degradación por
     shard caído, que es tolerancia a fallo esperada y viaja como datos en la
     respuesta de la API (`degraded`/`shard_statuses`), no como excepción."""
+
+
+class IncrementalIndexingError(BeaconScaleInfraError):
+    """Fallo de la indexación incremental: una instantánea publicada que no
+    se puede restaurar (manifiesto ausente, de otra versión o que referencia
+    ficheros que no están), o un error de `inverted-index-builder` al
+    escribir o fusionar segmentos — siempre envuelto, nunca la excepción
+    cruda de ese paquete."""
