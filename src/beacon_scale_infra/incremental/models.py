@@ -94,6 +94,11 @@ class IncrementalIndexerConfig:
     merge_segments_per_tier: int = 4
     merge_max_deleted_ratio: float = 0.3
     max_updates: int | None = None
+    document_store_prefix: str | None = None
+    """Si se indica, el documento completo de cada alta se guarda además en
+    `<prefijo>/<sha256(url)>.json` (y se borra con la baja): el índice
+    invertido solo guarda URL, título y longitud, y quien sirve resultados
+    necesita el texto para snippets, el rerank y `fetch_document`."""
 
     def __post_init__(self) -> None:
         if not self.worker_id:

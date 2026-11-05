@@ -25,6 +25,8 @@ reintentarlo no lo arreglaría y bloquearía la cola para siempre.
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import logging
 import time
 
@@ -42,6 +44,12 @@ from beacon_scale_infra.models import QueueMessage
 from beacon_scale_infra.protocols import MessageQueue, ObjectStorage
 
 logger = logging.getLogger(__name__)
+
+
+def document_key(prefix: str, url: str) -> str:
+    """Clave del documento de `url` en el almacén de documentos: hash y no la
+    URL tal cual, porque una URL puede no ser una clave de objeto válida."""
+    return f"{prefix.strip('/')}/{hashlib.sha256(url.encode('utf-8')).hexdigest()}.json"
 
 
 def coalesce_updates(updates: list[IndexUpdate]) -> tuple[list[IndexUpdate], list[str]]:
@@ -155,6 +163,17 @@ class IncrementalIndexer:
                     error,
                 )
         upserts, deletes = coalesce_updates(updates)
+        store = self._config.document_store_prefix
+        # Textos antes que el índice: una instantánea publicada nunca apunta a
+        # un documento que todavía no está en el almacén.
+        if store is not None:
+            for update in upserts:
+                await self._storage.put_object(
+                    self._config.bucket,
+                    document_key(store, update.url),
+                    json.dumps(dict(update.document or {}), ensure_ascii=False).encode("utf-8"),
+                    content_type="application/json",
+                )
         try:
             if upserts:
                 documents = [dict(u.document or {}) for u in upserts]
@@ -171,6 +190,10 @@ class IncrementalIndexer:
         version = await self._publisher.publish(index.root)
         self._stats.snapshots_published += 1
         self._stats.last_index_version = version
+        if store is not None:
+            for url in deletes:
+                if index.live_doc_id(url) is None:
+                    await self._storage.delete_object(self._config.bucket, document_key(store, url))
         for message in batch:
             await self._queue.ack(self._config.stream, self._config.group, message.message_id)
         elapsed = time.perf_counter() - started
