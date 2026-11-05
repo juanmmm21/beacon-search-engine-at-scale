@@ -200,6 +200,90 @@ services:
     networks: [beacon-scale]
     restart: on-failure
 
+  # --- Buscador vertical de documentación (perfil 'vertical') --------------
+  #
+  # docker compose --profile vertical up -d vertical-index-updater vertical-exporter
+  # docker compose --profile vertical run --rm vertical-crawl
+  #
+  # 'vertical-crawl' es un job: rastrea las fuentes de deploy/vertical-sources.json
+  # (robots.txt, Crawl-delay y presupuesto de páginas) y encola sus documentos;
+  # 'vertical-index-updater' los aplica como segmentos y publica cada
+  # instantánea en MinIO; 'vertical-exporter' la convierte en el bundle que
+  # carga beacon-search-console (volumen 'vertical-bundles').
+  vertical-crawl:
+    build: .
+    profiles: [vertical]
+    depends_on:
+      redis:
+        condition: service_healthy
+    environment:
+      BEACON_REDIS_URL: redis://redis:6379/0
+    command:
+      - vertical-crawl
+      - --sources
+      - /app/deploy/vertical-sources.json
+      - --work-dir
+      - /tmp/vertical-crawl
+      - --queue-backend
+      - redis
+      - --stream
+      - beacon-vertical-updates
+    networks: [beacon-scale]
+
+  vertical-index-updater:
+    build: .
+    profiles: [vertical]
+    depends_on:
+      minio-init:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    environment:
+      BEACON_S3_ENDPOINT_URL: http://minio:9000
+      BEACON_S3_ACCESS_KEY: beacon-dev
+      BEACON_S3_SECRET_KEY: beacon-dev-secret
+      BEACON_REDIS_URL: redis://redis:6379/0
+    command:
+      - index-updater
+      - --stream
+      - beacon-vertical-updates
+      - --group
+      - beacon-vertical-indexer
+      - --index-prefix
+      - vertical-index
+      - --document-store-prefix
+      - vertical-documents
+      - --local-root
+      - /var/lib/beacon/vertical-index
+      - --no-idle-shutdown
+    volumes:
+      - vertical-index:/var/lib/beacon/vertical-index
+    networks: [beacon-scale]
+    restart: on-failure
+
+  vertical-exporter:
+    build: .
+    profiles: [vertical]
+    depends_on:
+      minio-init:
+        condition: service_completed_successfully
+    environment:
+      BEACON_S3_ENDPOINT_URL: http://minio:9000
+      BEACON_S3_ACCESS_KEY: beacon-dev
+      BEACON_S3_SECRET_KEY: beacon-dev-secret
+    command:
+      - export-vertical
+      - --sources
+      - /app/deploy/vertical-sources.json
+      - --output-root
+      - /var/lib/beacon/vertical-bundles
+      - --watch-seconds
+      - "30"
+    volumes:
+      - vertical-bundles:/var/lib/beacon/vertical-bundles
+    networks: [beacon-scale]
+    restart: on-failure
+
   # --- Fase 5: réplicas de shard (query serving distribuido) --------------
   #
   # Cada servicio 'shard-N' descarga su partición del índice (subida por el
@@ -366,3 +450,5 @@ volumes:
   minio-data:
   redis-data:
   incremental-index:
+  vertical-index:
+  vertical-bundles:

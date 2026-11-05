@@ -102,6 +102,9 @@ from beacon_scale_infra.registry.consul import ConsulServiceRegistry
 from beacon_scale_infra.registry.local import InMemoryServiceRegistry
 from beacon_scale_infra.storage.local import LocalFilesystemObjectStorage
 from beacon_scale_infra.storage.s3 import S3ObjectStorage
+from beacon_scale_infra.vertical.bundle import export_bundle
+from beacon_scale_infra.vertical.pipeline import VerticalCrawlConfig, crawl_vertical
+from beacon_scale_infra.vertical.sources import load_sources
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -256,6 +259,11 @@ def _build_parser() -> argparse.ArgumentParser:
         default=Path(".incremental-index"),
         help="Copia de trabajo local del índice segmentado (restaurada si no existe)",
     )
+    index_updater_parser.add_argument(
+        "--document-store-prefix",
+        default=None,
+        help="Guarda también el documento completo de cada alta (lo usa el vertical)",
+    )
     index_updater_parser.add_argument("--flush-every-updates", type=int, default=500)
     index_updater_parser.add_argument("--merge-segments-per-tier", type=int, default=4)
     index_updater_parser.add_argument("--merge-max-deleted-ratio", type=float, default=0.3)
@@ -266,6 +274,61 @@ def _build_parser() -> argparse.ArgumentParser:
         help="No detenerse nunca al quedarse sin trabajo (servicio de larga duración)",
     )
     index_updater_parser.add_argument(
+        "--local-storage-root", type=Path, default=Path(".local-object-storage")
+    )
+
+    vertical_crawl_parser = subparsers.add_parser(
+        "vertical-crawl",
+        help="Rastrea las fuentes curadas del buscador vertical y encola sus documentos",
+    )
+    vertical_crawl_parser.add_argument(
+        "--sources", type=Path, default=Path("deploy/vertical-sources.json")
+    )
+    vertical_crawl_parser.add_argument("--work-dir", type=Path, default=Path(".vertical-crawl"))
+    vertical_crawl_parser.add_argument("--max-depth", type=int, default=4)
+    vertical_crawl_parser.add_argument("--min-delay-seconds", type=float, default=1.0)
+    vertical_crawl_parser.add_argument(
+        "--queue-backend", choices=["memory", "redis"], default="redis"
+    )
+    vertical_crawl_parser.add_argument("--stream", default="beacon-scale-index-updates")
+    vertical_crawl_parser.add_argument(
+        "--apply-inline",
+        action="store_true",
+        help="Sin Redis ni index-updater: aplica las altas en este mismo proceso",
+    )
+    vertical_crawl_parser.add_argument("--storage-backend", choices=["local", "s3"], default="s3")
+    vertical_crawl_parser.add_argument("--bucket", default="beacon-scale-dev")
+    vertical_crawl_parser.add_argument("--index-prefix", default="vertical-index")
+    vertical_crawl_parser.add_argument("--document-store-prefix", default="vertical-documents")
+    vertical_crawl_parser.add_argument(
+        "--local-root",
+        type=Path,
+        default=Path(".vertical-index"),
+        help="Copia de trabajo del índice con --apply-inline",
+    )
+    vertical_crawl_parser.add_argument(
+        "--local-storage-root", type=Path, default=Path(".local-object-storage")
+    )
+
+    export_vertical_parser = subparsers.add_parser(
+        "export-vertical",
+        help="Exporta la última instantánea del vertical como bundle para la consola",
+    )
+    export_vertical_parser.add_argument(
+        "--sources", type=Path, default=Path("deploy/vertical-sources.json")
+    )
+    export_vertical_parser.add_argument("--output-root", type=Path, required=True)
+    export_vertical_parser.add_argument("--storage-backend", choices=["local", "s3"], default="s3")
+    export_vertical_parser.add_argument("--bucket", default="beacon-scale-dev")
+    export_vertical_parser.add_argument("--index-prefix", default="vertical-index")
+    export_vertical_parser.add_argument("--document-store-prefix", default="vertical-documents")
+    export_vertical_parser.add_argument(
+        "--watch-seconds",
+        type=float,
+        default=None,
+        help="Comprueba periódicamente si hay una instantánea nueva (servicio de larga duración)",
+    )
+    export_vertical_parser.add_argument(
         "--local-storage-root", type=Path, default=Path(".local-object-storage")
     )
 
@@ -716,6 +779,7 @@ async def _run_index_updater(args: argparse.Namespace) -> None:
         idle_polls_before_shutdown=(
             None if args.no_idle_shutdown else args.idle_polls_before_shutdown
         ),
+        document_store_prefix=args.document_store_prefix,
     )
     queue = _build_queue(args.queue_backend)
     storage = _build_storage(args.storage_backend, args.local_storage_root)
@@ -732,6 +796,79 @@ async def _run_index_updater(args: argparse.Namespace) -> None:
             await storage.aclose()
         if isinstance(queue, RedisStreamsMessageQueue):
             await queue.aclose()
+
+
+async def _run_vertical_crawl(args: argparse.Namespace) -> None:
+    sources = load_sources(args.sources)
+    config = VerticalCrawlConfig(
+        work_dir=args.work_dir,
+        max_depth=args.max_depth,
+        min_delay_seconds=args.min_delay_seconds,
+    )
+    print(f"[vertical-crawl] presupuestos: {sources.budgets()}")
+    updates, reports = await crawl_vertical(sources, config)
+    for report in reports:
+        print(f"[vertical-crawl] {report}")
+    if not args.apply_inline:
+        queue = _build_queue(args.queue_backend)
+        try:
+            published = await publish_updates(queue, args.stream, updates)
+        finally:
+            if isinstance(queue, RedisStreamsMessageQueue):
+                await queue.aclose()
+        print(f"[vertical-crawl] {published} alta(s) encoladas en {args.stream}")
+        return
+
+    memory_queue = InMemoryMessageQueue()
+    storage = _build_storage(args.storage_backend, args.local_storage_root)
+    try:
+        indexer_config = IncrementalIndexerConfig(
+            worker_id="vertical-inline",
+            local_root=args.local_root,
+            stream=args.stream,
+            bucket=args.bucket,
+            index_prefix=args.index_prefix,
+            document_store_prefix=args.document_store_prefix,
+            poll_block_ms=10,
+            idle_polls_before_shutdown=1,
+        )
+        await publish_updates(memory_queue, args.stream, updates)
+        stats = await IncrementalIndexer(indexer_config, queue=memory_queue, storage=storage).run()
+    finally:
+        if isinstance(storage, S3ObjectStorage):
+            await storage.aclose()
+    print(
+        f"[vertical-crawl] índice aplicado: {stats.live_documents} vivos, "
+        f"versión {stats.last_index_version}"
+    )
+
+
+async def _run_export_vertical(args: argparse.Namespace) -> None:
+    sources = load_sources(args.sources)
+    storage = _build_storage(args.storage_backend, args.local_storage_root)
+    try:
+        while True:
+            export = await export_bundle(
+                storage,
+                args.bucket,
+                args.index_prefix,
+                args.document_store_prefix,
+                sources,
+                args.output_root,
+            )
+            if export is None:
+                print("[export-vertical] aún no hay ninguna instantánea publicada")
+            elif not export.reused:
+                print(
+                    f"[export-vertical] {export.path} ({export.documents} documentos, "
+                    f"{export.missing_documents} sin texto)"
+                )
+            if args.watch_seconds is None:
+                return
+            await asyncio.sleep(args.watch_seconds)
+    finally:
+        if isinstance(storage, S3ObjectStorage):
+            await storage.aclose()
 
 
 async def _run_feed_recrawl(args: argparse.Namespace) -> None:
@@ -1009,6 +1146,10 @@ async def _dispatch(args: argparse.Namespace) -> None:
         await _run_index_updater(args)
     elif args.command == "feed-recrawl":
         await _run_feed_recrawl(args)
+    elif args.command == "vertical-crawl":
+        await _run_vertical_crawl(args)
+    elif args.command == "export-vertical":
+        await _run_export_vertical(args)
     elif args.command == "compute-pagerank":
         await _run_compute_pagerank(args)
     elif args.command == "shard-index":

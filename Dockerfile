@@ -26,6 +26,8 @@ WORKDIR /app
 
 COPY pyproject.toml LICENSE README.md ./
 COPY src/ src/
+# Lista curada de fuentes del buscador vertical (vertical-crawl, export-vertical).
+COPY deploy/vertical-sources.json deploy/vertical-sources.json
 
 RUN pip install --no-cache-dir .
 
