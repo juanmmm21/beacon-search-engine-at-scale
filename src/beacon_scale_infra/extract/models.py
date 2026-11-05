@@ -61,6 +61,9 @@ class ExtractWorkerConfig:
     batch_size: int = 10
     poll_block_ms: int = 5000
     idle_polls_before_shutdown: int | None = 6
+    index_updates_stream: str | None = None
+    """Si se indica, cada documento extraído se publica además como alta
+    (`IndexUpdate`) en este stream, para el indexador incremental."""
 
     def __post_init__(self) -> None:
         if not self.worker_id:

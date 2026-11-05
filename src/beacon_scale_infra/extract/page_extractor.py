@@ -45,6 +45,7 @@ from html_content_extractor.models import (
     ExtractionConfig,
 )
 from html_content_extractor.normalize import normalize_text
+from html_content_extractor.simhash import format_fingerprint, simhash64
 
 logger = logging.getLogger(__name__)
 
@@ -127,4 +128,8 @@ def extract_single_page(
         encoding_used=encoding_used,
         depth=depth,
         word_count=len(normalized_text.split()),
+        # Huella SimHash de `html-content-extractor` (>= 0.2.0): viaja con el
+        # documento para que cualquier consumidor detecte casi-duplicados sin
+        # volver a leer el texto.
+        simhash=format_fingerprint(simhash64(normalized_text)),
     )

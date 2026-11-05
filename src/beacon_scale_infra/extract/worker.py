@@ -43,6 +43,7 @@ from beacon_scale_infra.extract.partitioning import (
     object_key_for_discarded_part,
     object_key_for_document_part,
 )
+from beacon_scale_infra.incremental.models import IndexUpdate
 from beacon_scale_infra.protocols import MessageQueue, ObjectStorage
 
 logger = logging.getLogger(__name__)
@@ -189,6 +190,14 @@ class ExtractWorker:
             await self._storage.put_object(
                 self._config.bucket, key, body, content_type="application/jsonl"
             )
+            # Después de escribir la parte, no antes: así el índice por lotes
+            # (fase 3) y el incremental nunca ven documentos distintos.
+            if self._config.index_updates_stream is not None:
+                for document in self._document_buffer:
+                    await self._queue.publish(
+                        self._config.index_updates_stream,
+                        IndexUpdate.upsert(document.to_json_dict()).to_payload(),
+                    )
             self._total_documents_written += len(self._document_buffer)
             self._document_buffer.clear()
 
